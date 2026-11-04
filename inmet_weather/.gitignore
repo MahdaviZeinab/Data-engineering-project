@@ -1,0 +1,12 @@
+# Raw data and the data lake are too big for Git. Git holds the CODE;
+# the data can always be rebuilt by running the pipeline.
+data/
+spark-warehouse/
+metastore_db/
+derby.log
+__pycache__/
+.pytest_cache/
+.venv/
+.DS_Store
+*.zip
+*.part

@@ -1,0 +1,4 @@
+pyspark==3.5.3   # works with Java 8, 11 and 17
+requests
+tqdm
+pytest
