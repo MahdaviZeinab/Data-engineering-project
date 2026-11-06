@@ -1,0 +1,37 @@
+# Runs the tests on every push to main and on every pull request.
+# Runs on a free GitHub-hosted machine (ubuntu-latest), NOT on the OpenStack VM.
+# A red check means: do not merge, something broke.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:          # lets you start it by hand from the Actions tab
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: inmet_weather   # the code lives in this sub-folder
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4        # Spark needs Java
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: inmet_weather/requirements.txt
+
+      - name: Install packages
+        run: pip install -r requirements.txt
+
+      - name: Run tests
+        run: python -m pytest -q

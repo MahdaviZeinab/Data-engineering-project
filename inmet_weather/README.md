@@ -20,7 +20,6 @@ inmet_weather/
 ├── silver/                 Silver layer (next step)
 ├── gold/                   Gold layer (later)
 ├── tests/                  tests for all layers
-├── github_workflows/       GitHub Actions (move to .github/workflows/ before pushing)
 ├── data/                   NOT in Git (see .gitignore)
 │   ├── raw/<year>/         the original INMET CSV files
 │   └── lake/<env>/         the output: bronze/, silver/, gold/
@@ -63,7 +62,12 @@ If `DAT535_OUTPUT_DIR` is set (as in the course lab CI), the output goes there.
 
 All tables are Parquet, split into one folder per year (`source_year=2020`, …).
 
-## GitHub
+## GitHub Actions
 
-Make this `inmet_weather` folder the Git repository. Before the first push, move the workflows:
-`mkdir -p .github/workflows && mv github_workflows/*.yml .github/workflows/`
+The workflows are in `.github/workflows/` at the repository root:
+
+- `ci.yml` runs the tests on a GitHub-hosted machine on every push to `main` and every pull request.
+- `bronze-ingest.yml` runs the Bronze pipeline on our OpenStack VM (self-hosted runner, labels
+  `self-hosted, linux, openstack`). Data is kept on the VM in `/data/inmet`.
+
+How to set up the VM and the runner: see [RUNNER_SETUP.md](RUNNER_SETUP.md).

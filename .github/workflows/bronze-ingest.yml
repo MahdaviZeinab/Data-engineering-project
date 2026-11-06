@@ -1,0 +1,88 @@
+# Bronze batch run on the OpenStack VM (self-hosted runner).
+#   1. download + unzip the INMET yearly files   (bronze/injection.py)
+#   2. load them into the Bronze tables with Spark (bronze/bronze_ingest.py)
+#
+# Runs on the runner that has the labels  self-hosted + linux + openstack.
+# The data is kept OUTSIDE the GitHub work folder, in DATA_ROOT on the VM, so it
+# survives between runs (GitHub cleans the work folder at every checkout):
+#   $DATA_ROOT/raw/<year>/*.CSV       raw INMET files
+#   $DATA_ROOT/lake/<env>/bronze/     Bronze output (Parquet)
+#   $DATA_ROOT/venv/                  Python packages (re-used between runs)
+name: bronze-ingest
+
+on:
+  workflow_dispatch:                   # "Run workflow" button in the Actions tab
+    inputs:
+      years:
+        description: "Year(s) to ingest, separated by spaces, e.g. 2025 or 2020 2021 2022"
+        default: "2025"
+      env:
+        description: "Output environment"
+        type: choice
+        options: [prod, dev]
+        default: prod
+  schedule:
+    - cron: "0 2 * * *"                # every day 02:00 UTC (uses the defaults below)
+
+# Never run two ingests at the same time on the same data.
+concurrency:
+  group: bronze-ingest
+  cancel-in-progress: false
+
+jobs:
+  ingest:
+    runs-on: [self-hosted, linux, openstack]
+    timeout-minutes: 240
+    env:
+      DATA_ROOT: /data/inmet           # folder on the VM (see the setup guide)
+      YEARS: ${{ inputs.years || '2025' }}
+      LAKE_ENV: ${{ inputs.env || 'prod' }}
+    defaults:
+      run:
+        working-directory: inmet_weather
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check inputs and tools on the VM
+        run: |
+          # only digits and spaces are allowed in "years"
+          if ! [[ "$YEARS" =~ ^[0-9]{4}( [0-9]{4})*$ ]]; then
+            echo "Bad years input: '$YEARS' (use e.g. 2025 or 2020 2021)"; exit 1
+          fi
+          java -version
+          python3 --version
+          df -h "$DATA_ROOT"
+
+      - name: Python environment (created once, then re-used)
+        run: |
+          if [ ! -x "$DATA_ROOT/venv/bin/python" ]; then
+            python3 -m venv "$DATA_ROOT/venv"
+          fi
+          "$DATA_ROOT/venv/bin/pip" install --quiet --upgrade pip
+          "$DATA_ROOT/venv/bin/pip" install --quiet -r requirements.txt
+          echo "$DATA_ROOT/venv/bin" >> "$GITHUB_PATH"   # later steps use this python
+
+      - name: Point data/raw to the folder on the VM
+        run: |
+          mkdir -p "$DATA_ROOT/raw" data
+          ln -sfn "$DATA_ROOT/raw" data/raw
+          ls -la data
+
+      - name: Land raw files (download + unzip)
+        run: python bronze/injection.py --years $YEARS
+
+      - name: Bronze ingestion (Spark)
+        env:
+          DAT535_OUTPUT_DIR: ${{ env.DATA_ROOT }}/lake/${{ env.LAKE_ENV }}
+        run: python -m bronze.bronze_ingest --source "$DATA_ROOT/raw" --env "$LAKE_ENV" --years $YEARS
+
+      - name: Keep the run summary and file checks as evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bronze-run-${{ github.run_id }}
+          path: |
+            ${{ env.DATA_ROOT }}/lake/${{ env.LAKE_ENV }}/bronze/_runs/
+            ${{ env.DATA_ROOT }}/lake/${{ env.LAKE_ENV }}/bronze/inmet_files/
+          if-no-files-found: warn
+          retention-days: 30
