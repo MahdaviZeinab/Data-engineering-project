@@ -2,6 +2,10 @@
 #   1. download + unzip the INMET yearly files   (bronze/injection.py)
 #   2. load them into the Bronze tables with Spark (bronze/bronze_ingest.py)
 #
+# When does it run?
+#   - automatically after every push to main
+#   - by hand: Actions tab -> bronze-ingest -> Run workflow
+#
 # Runs on the runner that has the labels  self-hosted + linux + openstack.
 # The data is kept OUTSIDE the GitHub work folder, in DATA_ROOT on the VM, so it
 # survives between runs (GitHub cleans the work folder at every checkout):
@@ -11,18 +15,18 @@
 name: bronze-ingest
 
 on:
+  push:
+    branches: [main]
   workflow_dispatch:                   # "Run workflow" button in the Actions tab
     inputs:
       years:
         description: "Year(s) to ingest, separated by spaces, e.g. 2025 or 2020 2021 2022"
-        default: "2025"
+        default: "2020 2021 2022 2023 2024 2025"
       env:
         description: "Output environment"
         type: choice
         options: [prod, dev]
         default: prod
-  schedule:
-    - cron: "0 2 * * *"                # every day 02:00 UTC (uses the defaults below)
 
 # Never run two ingests at the same time on the same data.
 concurrency:
@@ -35,7 +39,7 @@ jobs:
     timeout-minutes: 240
     env:
       DATA_ROOT: /data/inmet           # folder on the VM (see the setup guide)
-      YEARS: ${{ inputs.years || '2025' }}
+      YEARS: ${{ inputs.years || '2020 2021 2022 2023 2024 2025' }}   # after a push: all years
       LAKE_ENV: ${{ inputs.env || 'prod' }}
     defaults:
       run:
