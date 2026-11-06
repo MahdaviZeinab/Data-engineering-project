@@ -4,8 +4,7 @@ How it works:
 
 | Workflow | Runs on | When |
 |---|---|---|
-| `ci.yml` (tests) | GitHub's free machine (`ubuntu-latest`) | every push to `main`, every pull request |
-| `bronze-ingest.yml` (download + Spark) | **your OpenStack VM** (self-hosted runner) | when you click "Run workflow", and every day 02:00 UTC |
+| `bronze-ingest.yml` (download + Spark) | **your OpenStack VM** (self-hosted runner) | automatically after every push to `main`, and when you click "Run workflow" |
 
 The VM runs a small program from GitHub (the "runner"). It connects **out** to GitHub over
 HTTPS and waits for jobs. GitHub never connects in to the VM, so you do not need to open any port
@@ -144,7 +143,7 @@ sudo ./svc.sh status             # should say "active (running)"
 ## D. Push the workflows to GitHub (on your Mac)
 
 The workflow files are already in the right place:
-`Data-engineering-project/.github/workflows/ci.yml` and `bronze-ingest.yml`
+`Data-engineering-project/.github/workflows/bronze-ingest.yml`
 (GitHub only reads workflows from `.github/workflows/` at the **repo root**).
 
 ```bash
@@ -162,12 +161,12 @@ git push origin main
 
 ## E. Run it
 
-### E1. Tests (automatic)
+### E1. Automatic
 
-The push in D already starts **ci**. Open the repo → **Actions** tab → **ci** → it should get a
-green check after a few minutes.
+Every push to `main` starts **bronze-ingest** on the VM with all years and env `prod`.
+Open the repo → **Actions** tab → **bronze-ingest** to watch it.
 
-### E2. Bronze (on the VM)
+### E2. By hand
 
 1. **Actions** tab → **bronze-ingest** (left side) → **Run workflow** (right side).
 2. Fill in:
@@ -214,11 +213,10 @@ du -sh /data/inmet/*
   public, code from a stranger's pull request could then run on your VM. Now only people with
   write access can start it. Also set *Settings → Actions → General → Fork pull request workflows
   → Require approval for all outside collaborators*.
-- **The daily schedule** (02:00 UTC) runs with years `2025` and env `prod`. Because years that are
-  already downloaded are skipped, it re-loads the same files each day. Remove the two `schedule:`
-  lines in `bronze-ingest.yml` if you only want manual runs. GitHub runs schedules only from the
-  `main` branch, and the VM must be on at that time.
+- **After a push** the Bronze run starts by itself, with all years (`2020 … 2025`) and env
+  `prod`. Years already downloaded are skipped, so later pushes only re-run the Spark part.
+  Pull requests never start it.
 - **Stop / remove the runner:** `sudo ./svc.sh stop`, `sudo ./svc.sh uninstall`, then
   `./config.sh remove --token <TOKEN>` (token from the runner's page in GitHub).
 - If you shut down the VM, the runner shows **Offline** and bronze jobs wait (for up to 24 h)
-  until it is back. Tests (`ci`) are not affected.
+  until it is back.

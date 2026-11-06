@@ -64,9 +64,8 @@ All tables are Parquet, split into one folder per year (`source_year=2020`, …)
 
 ## GitHub Actions
 
-The workflows are in `.github/workflows/` at the repository root:
+The workflow is in `.github/workflows/` at the repository root:
 
-- `ci.yml` runs the tests on a GitHub-hosted machine on every push to `main` and every pull request.
 - `bronze-ingest.yml` runs the Bronze pipeline on our OpenStack VM (self-hosted runner, labels
   `self-hosted, linux, openstack`). Data is kept on the VM in `/data/inmet`.
 
