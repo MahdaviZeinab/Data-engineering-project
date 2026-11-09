@@ -184,3 +184,21 @@ def test_invalid_hour_does_not_hide_a_missing_hour(spark, tmp_path):
     # Bronze keeps the raw text: the "2500 UTC" line is still there
     hourly = read(spark, out, "inmet_hourly")
     assert hourly.where("`Hora UTC` = '2500 UTC'").count() == 1
+
+
+
+def test_all_hours_but_other_problems_is_not_plain_complete(spark, tmp_path):
+    rows = hours(1)                                       # all 24 hours are there
+    rows = rows + [rows[5], "2020/01/01;0600 UTC;0;1"]    # + one duplicate + one broken line
+    y = tmp_path / "src" / "2020"
+    write(y, "INMET_SE_SP_A001_SAO PAULO_01-01-2020_A_01-01-2020.CSV",
+          station("A001", "X") + [EXPECTED_HEADER + ";"] + rows)
+
+    out = str(tmp_path / "out")
+    report = run_bronze(spark, str(tmp_path / "src"), out, years=[2020])
+    f = read(spark, out, "inmet_files").first()
+
+    assert f["missing_hours"] == 0
+    assert f["duplicate_rows"] == 1 and f["quarantined_lines"] == 1
+    assert f["status"] == "COMPLETE_WITH_ISSUES"
+    assert report["complete"] == 0 and report["complete_with_issues"] == 1

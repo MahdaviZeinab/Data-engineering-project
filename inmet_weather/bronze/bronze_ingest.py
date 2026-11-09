@@ -175,6 +175,10 @@ def check_files(files, lines):
         F.when(F.col("file_problem").isNotNull(), "QUARANTINED")
          # != 0, not > 0: a negative number is impossible and also a problem
          .when(F.col("missing_hours") != 0, "INCOMPLETE")
+         # all hours are there, but something else was wrong in the file
+         .when((F.col("duplicate_rows") > 0) | (F.col("quarantined_lines") > 0)
+               | (F.col("invalid_hours") > 0) | (F.col("extra_hours") > 0),
+               "COMPLETE_WITH_ISSUES")
          .otherwise("COMPLETE"),
     ).drop("distinct_hours", "hours_in_range")
 
@@ -293,12 +297,14 @@ def run_bronze(spark, source, output, years=None, run_id=None):
     row = manifest.agg(
         F.count("*").alias("files"),
         F.sum(F.when(F.col("status") == "COMPLETE", 1).otherwise(0)).alias("complete"),
+         F.sum(F.when(F.col("status") == "COMPLETE_WITH_ISSUES", 1).otherwise(0)).alias("complete_with_issues"),
         F.sum(F.when(F.col("status") == "INCOMPLETE", 1).otherwise(0)).alias("incomplete"),
         F.sum(F.when(F.col("status") == "QUARANTINED", 1).otherwise(0)).alias("quarantined"),
         F.sum("expected_rows").alias("expected_rows"),
         F.sum("received_rows").alias("received_rows"),
         F.sum("missing_hours").alias("missing_hours"),
         F.sum("extra_hours").alias("extra_hours"),
+        F.sum("invalid_hours").alias("invalid_hours"),
         F.sum("duplicate_rows").alias("duplicate_rows"),
         F.sum("quarantined_lines").alias("quarantined_lines"),
     ).first()
