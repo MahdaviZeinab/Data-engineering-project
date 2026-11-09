@@ -84,6 +84,9 @@ def read_files(spark, source, years):
     path = F.expr("url_decode(replace(path, '+', '%2B'))")   # "%20" -> " "
     df = raw.select(
         F.element_at(F.split(path, "/"), -1).alias("source_file"),
+        # the year comes from the folder (data/raw/<year>/), not from the file
+        # name: a bad or unusual file name must not move rows to another year
+        F.element_at(F.split(path, "/"), -2).cast("int").alias("source_year"),
         F.sha2("content", 256).alias("file_sha256"),
         F.col("length").alias("file_bytes"),
         lines.alias("lines"),
@@ -95,7 +98,6 @@ def read_files(spark, source, years):
     start = F.to_date(name_part(5), "dd-MM-yyyy")
     end = F.to_date(name_part(6), "dd-MM-yyyy")
     df = (df.withColumn("station_code", F.upper(name_part(3)))
-            .withColumn("source_year", F.year(start))
             .withColumn("start_date", start)
             .withColumn("end_date", end)
             .withColumn("expected_rows", (F.datediff(end, start) + 1) * 24))
