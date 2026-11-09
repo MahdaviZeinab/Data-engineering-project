@@ -53,6 +53,13 @@ jobs:
           if ! [[ "$YEARS" =~ ^[0-9]{4}( [0-9]{4})*$ ]]; then
             echo "Bad years input: '$YEARS' (use e.g. 2025 or 2020 2021)"; exit 1
           fi
+          # Make the data folder if it is missing (for example after it was deleted).
+          # It starts empty, so the next steps download everything again.
+          if ! mkdir -p "$DATA_ROOT/raw" "$DATA_ROOT/lake"; then
+            echo "Cannot create $DATA_ROOT. Run once on the VM:"
+            echo "  sudo mkdir -p $DATA_ROOT && sudo chown \$USER $DATA_ROOT"
+            exit 1
+          fi
           java -version
           python3 --version
           df -h "$DATA_ROOT"
