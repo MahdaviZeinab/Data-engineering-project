@@ -148,11 +148,15 @@ def split_lines(files):
 def check_files(files, lines):
     good = lines.where(F.col("problem").isNull())
     hour = F.concat_ws(" ", F.col("Data"), F.col("Hora UTC"))
+    # a real hour is "0000 UTC" ... "2300 UTC"; anything else (e.g. "2500 UTC")
+    # is kept as raw text, but it must not count as a received hour
+    valid_hour = F.col("Hora UTC").rlike(r"^([01][0-9]|2[0-3])00 UTC$")
     counts = good.groupBy("source_file").agg(
         F.count("*").alias("received_rows"),
         F.countDistinct(hour).alias("distinct_hours"),
-        # only hours inside the file name's dates count towards "complete"
-        F.countDistinct(F.when(F.col("in_date_range"), hour)).alias("hours_in_range"),
+        # only VALID hours inside the file name's dates count towards "complete"
+        F.countDistinct(F.when(F.col("in_date_range") & valid_hour, hour)).alias("hours_in_range"),
+        F.sum(F.when(valid_hour, 0).otherwise(1)).alias("invalid_hours"),
         # rows outside those dates are reported on their own
         F.sum(F.when(F.col("in_date_range"), 0).otherwise(1)).alias("extra_hours"),
     )
@@ -163,13 +167,14 @@ def check_files(files, lines):
                .join(counts, "source_file", "left")
                .join(bad, "source_file", "left")
                .fillna(0, ["received_rows", "distinct_hours", "hours_in_range",
-                           "extra_hours", "quarantined_lines"])
+                           "extra_hours", "invalid_hours", "quarantined_lines"])
                .withColumn("duplicate_rows", F.col("received_rows") - F.col("distinct_hours"))
                .withColumn("missing_hours", F.col("expected_rows") - F.col("hours_in_range")))
     return df.withColumn(
         "status",
         F.when(F.col("file_problem").isNotNull(), "QUARANTINED")
-         .when(F.col("missing_hours") > 0, "INCOMPLETE")
+         # != 0, not > 0: a negative number is impossible and also a problem
+         .when(F.col("missing_hours") != 0, "INCOMPLETE")
          .otherwise("COMPLETE"),
     ).drop("distinct_hours", "hours_in_range")
 
