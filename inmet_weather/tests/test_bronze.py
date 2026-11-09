@@ -139,3 +139,27 @@ def test_no_rows_are_lost(spark, tmp_path):
     assert read(spark, out, "inmet_files").count() == report["files"]
     assert read(spark, out, "inmet_hourly").count() == report["received_rows"]
     assert read(spark, out, "inmet_quarantine").count() == report["quarantined_lines"]
+
+    
+
+def test_one_failed_table_replaces_no_table(spark, source, tmp_path, monkeypatch):
+    out = str(tmp_path / "out")
+    run_bronze(spark, str(source), out, run_id="good")
+
+    # make the check of the LAST table (inmet_files) fail in the next run
+    import bronze.bronze_ingest as bronze_ingest
+    real = bronze_ingest.write_temp
+
+    def failing(spark, df, path, years, expected_rows, run_id):
+        if path.endswith("inmet_files"):
+            raise RuntimeError("simulated failure")
+        return real(spark, df, path, years, expected_rows, run_id)
+
+    monkeypatch.setattr(bronze_ingest, "write_temp", failing)
+    with pytest.raises(RuntimeError, match="simulated failure"):
+        run_bronze(spark, str(source), out, run_id="bad")
+
+    # all three tables still come from the "good" run
+    for table in ["inmet_hourly", "inmet_quarantine", "inmet_files"]:
+        ids = [r[0] for r in read(spark, out, table).select("_bronze_run_id").distinct().collect()]
+        assert ids == ["good"], table
