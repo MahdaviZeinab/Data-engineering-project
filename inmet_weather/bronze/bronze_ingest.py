@@ -84,6 +84,9 @@ def read_files(spark, source, years):
     path = F.expr("url_decode(replace(path, '+', '%2B'))")   # "%20" -> " "
     df = raw.select(
         F.element_at(F.split(path, "/"), -1).alias("source_file"),
+        # the year comes from the folder (data/raw/<year>/), not from the file
+        # name: a bad or unusual file name must not move rows to another year
+        F.element_at(F.split(path, "/"), -2).cast("int").alias("source_year"),
         F.sha2("content", 256).alias("file_sha256"),
         F.col("length").alias("file_bytes"),
         lines.alias("lines"),
@@ -95,7 +98,6 @@ def read_files(spark, source, years):
     start = F.to_date(name_part(5), "dd-MM-yyyy")
     end = F.to_date(name_part(6), "dd-MM-yyyy")
     df = (df.withColumn("station_code", F.upper(name_part(3)))
-            .withColumn("source_year", F.year(start))
             .withColumn("start_date", start)
             .withColumn("end_date", end)
             .withColumn("expected_rows", (F.datediff(end, start) + 1) * 24))
@@ -175,40 +177,79 @@ def check_files(files, lines):
 # --------------------------------------------------------------------------
 # Step 4: write safely, replacing only the years of this run
 # --------------------------------------------------------------------------
-def replace_years(spark, df, path, years, expected_rows, run_id):
-    """
-    1. Write the new data to a temporary folder (the old data is not touched).
-    2. Count the rows there. If the count is wrong, stop: the old data is still fine.
-    3. Swap: move each old year folder away, move the new one in, delete the old one.
-    Folders starting with "_" are ignored by Spark, so readers never see the temp data.
-    """
+def _fs(spark, path):
     hadoop = spark._jvm.org.apache.hadoop.fs
-    fs = hadoop.Path(path).getFileSystem(spark._jsc.hadoopConfiguration())
-    temp, old = f"{path}/_new_{run_id}", f"{path}/_old_{run_id}"
+    return hadoop, hadoop.Path(path).getFileSystem(spark._jsc.hadoopConfiguration())
 
-    # 1. write to the temporary folder
+
+def write_temp(spark, df, path, years, expected_rows, run_id):
+    """
+    Phase 1: write the new data to <path>/_new_<run_id> and check it.
+    The real table is not touched. Raises if the check fails.
+    Folders starting with "_" are ignored by Spark, so readers never see it.
+    """
+    hadoop, fs = _fs(spark, path)
+    temp = f"{path}/_new_{run_id}"
     df.repartition("source_year").write.mode("overwrite").partitionBy("source_year").parquet(temp)
 
-    # 2. check it before we touch the real table
     try:
-        written = spark.read.parquet(temp).count()
-    except AnalysisException:          # no rows at all (e.g. nothing quarantined)
-        written = 0
-    if written != expected_rows:
-        fs.delete(hadoop.Path(temp), True)
-        raise RuntimeError(f"{path}: wrote {written} rows, expected {expected_rows}. "
-                           "Nothing was replaced.")
+        # 1. the row count must match the run report
+        try:
+            written = spark.read.parquet(temp).count()
+        except AnalysisException:      # no rows at all (e.g. nothing quarantined)
+            written = 0
+        if written != expected_rows:
+            raise RuntimeError(f"{path}: wrote {written} rows, expected {expected_rows}. "
+                               "Nothing was replaced.")
 
-    # 3. swap the year folders
+        # 2. only the years of this run may be there; any other folder would be
+        #    deleted with the temp folder later, so stop instead of losing rows
+        allowed = {f"source_year={y}" for y in years}
+        found = {s.getPath().getName() for s in fs.listStatus(hadoop.Path(temp))
+                 if s.isDirectory()}
+        extra = sorted(found - allowed)
+        if extra:
+            raise RuntimeError(f"{path}: rows outside the years {years}: {extra}. "
+                               "Nothing was replaced.")
+    except Exception:
+        fs.delete(hadoop.Path(temp), True)
+        raise
+
+
+def swap_years(spark, path, years, run_id):
+    """
+    Phase 2: for each year, move the old folder away and the new one in.
+    fs.rename() returns False on failure instead of raising, so every result
+    is checked. On failure the old data is kept in <path>/_old_<run_id>.
+    """
+    hadoop, fs = _fs(spark, path)
+    temp, old = f"{path}/_new_{run_id}", f"{path}/_old_{run_id}"
+
+    def move(src, dst):
+        if not fs.rename(hadoop.Path(src), hadoop.Path(dst)):
+            raise RuntimeError(f"Could not move {src} to {dst}. The old data is "
+                               f"still in {old}; move it back by hand.")
+
     fs.mkdirs(hadoop.Path(old))
     for y in years:
-        current, fresh = hadoop.Path(f"{path}/source_year={y}"), hadoop.Path(f"{temp}/source_year={y}")
-        if fs.exists(current):
-            fs.rename(current, hadoop.Path(f"{old}/source_year={y}"))
-        if fs.exists(fresh):
-            fs.rename(fresh, current)
+        current, fresh = f"{path}/source_year={y}", f"{temp}/source_year={y}"
+        if fs.exists(hadoop.Path(current)):
+            move(current, f"{old}/source_year={y}")
+        if fs.exists(hadoop.Path(fresh)):
+            move(fresh, current)
+    # only now, when every move worked, is the old data deleted
     fs.delete(hadoop.Path(old), True)
     fs.delete(hadoop.Path(temp), True)
+
+
+def replace_years(spark, df, path, years, expected_rows, run_id):
+    """Write + check + swap one table (both phases)."""
+    write_temp(spark, df, path, years, expected_rows, run_id)
+    swap_years(spark, path, years, run_id)
+
+def drop_temp(spark, path, run_id):
+    hadoop, fs = _fs(spark, path)
+    fs.delete(hadoop.Path(f"{path}/_new_{run_id}"), True)
 
 
 def git_commit():
@@ -259,13 +300,25 @@ def run_bronze(spark, source, output, years=None, run_id=None):
     report = {"run_id": run_id, "years": years, "time_utc": now.isoformat(timespec="seconds"),
               **{k: int(v or 0) for k, v in row.asDict().items()}}
 
-    replace_years(spark, hourly, f"{bronze}/inmet_hourly", years,
-                  report["received_rows"], run_id)
-    replace_years(spark, quarantine, f"{bronze}/inmet_quarantine", years,
-                  report["quarantined_lines"], run_id)
-    replace_years(spark, manifest.select("*", *evidence), f"{bronze}/inmet_files", years,
-                  report["files"], run_id)
-    files.unpersist()
+    tables = [
+        (hourly, f"{bronze}/inmet_hourly", report["received_rows"]),
+        (quarantine, f"{bronze}/inmet_quarantine", report["quarantined_lines"]),
+        (manifest.select("*", *evidence), f"{bronze}/inmet_files", report["files"]),
+    ]
+    # Phase 1: write and check ALL tables first. If one fails, none is replaced,
+    # so the three tables always come from the same run.
+    try:
+        for df, path, expected in tables:
+            write_temp(spark, df, path, years, expected, run_id)
+    except Exception:
+        for _, path, _ in tables:
+            drop_temp(spark, path, run_id)
+        raise
+    finally:
+        files.unpersist()
+    # Phase 2: all checks passed, now swap the year folders of every table.
+    for _, path, _ in tables:
+        swap_years(spark, path, years, run_id)
 
     os.makedirs(f"{bronze}/_runs", exist_ok=True)
     with open(f"{bronze}/_runs/{run_id}.json", "w") as f:

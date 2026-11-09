@@ -116,3 +116,50 @@ def test_failed_write_keeps_the_old_data(spark, source, tmp_path):
     after = read(spark, out, "inmet_hourly")
     assert after.count() == before                                    # old data untouched
     assert [r[0] for r in after.select("_bronze_run_id").distinct().collect()] == ["good"]
+
+
+def test_no_rows_are_lost(spark, tmp_path):
+    y = tmp_path / "src" / "2020"
+    header = EXPECTED_HEADER + ";"
+
+    # 1) a normal file
+    write(y, "INMET_SE_SP_A001_SAO PAULO_01-01-2020_A_01-01-2020.CSV",
+          station("A001", "X") + [header] + hours(1))
+    # 2) a file with a bad name
+    write(y, "broken_name.CSV",
+          station("A009", "Y") + [header] + hours(1))
+    # 3) a file in the 2020 folder whose name starts in 2019
+    write(y, "INMET_SE_SP_A005_ITU_31-12-2019_A_01-01-2020.CSV",
+          station("A005", "ITU") + [header] + hours(1))
+
+    out = str(tmp_path / "out")
+    report = run_bronze(spark, str(tmp_path / "src"), out, years=[2020])
+
+    # what is on disk must match the report
+    assert read(spark, out, "inmet_files").count() == report["files"]
+    assert read(spark, out, "inmet_hourly").count() == report["received_rows"]
+    assert read(spark, out, "inmet_quarantine").count() == report["quarantined_lines"]
+
+    
+
+def test_one_failed_table_replaces_no_table(spark, source, tmp_path, monkeypatch):
+    out = str(tmp_path / "out")
+    run_bronze(spark, str(source), out, run_id="good")
+
+    # make the check of the LAST table (inmet_files) fail in the next run
+    import bronze.bronze_ingest as bronze_ingest
+    real = bronze_ingest.write_temp
+
+    def failing(spark, df, path, years, expected_rows, run_id):
+        if path.endswith("inmet_files"):
+            raise RuntimeError("simulated failure")
+        return real(spark, df, path, years, expected_rows, run_id)
+
+    monkeypatch.setattr(bronze_ingest, "write_temp", failing)
+    with pytest.raises(RuntimeError, match="simulated failure"):
+        run_bronze(spark, str(source), out, run_id="bad")
+
+    # all three tables still come from the "good" run
+    for table in ["inmet_hourly", "inmet_quarantine", "inmet_files"]:
+        ids = [r[0] for r in read(spark, out, table).select("_bronze_run_id").distinct().collect()]
+        assert ids == ["good"], table
