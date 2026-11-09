@@ -178,7 +178,7 @@ What happens on the VM:
 
 1. checks Java, Python and free disk
 2. creates `/data/inmet/venv` the first time and installs `requirements.txt`
-3. downloads and unzips the INMET files into `/data/inmet/raw/<year>/` (years already there are skipped)
+3. downloads and unzips the INMET files into `/data/inmet/raw/<year>/` (years with a `_DONE` file are skipped; half-finished years are unzipped again)
 4. Spark writes Bronze to `/data/inmet/lake/<env>/bronze/`
 5. the run summary (`_runs/*.json`) and the file checks are attached to the run as an **artifact**
    (download it at the bottom of the run page)
