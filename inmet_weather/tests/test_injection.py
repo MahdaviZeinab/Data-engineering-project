@@ -5,6 +5,7 @@ Run:  python -m pytest -q tests/test_injection.py
 import zipfile
 
 import pytest
+import os
 
 from bronze import injection
 
@@ -69,3 +70,23 @@ def test_same_name_different_content_stops_the_year(raw):
     make_zip(raw, 2020, {f"x/{A}": "a", f"y/{A}": "DIFFERENT"})
     assert not injection.land(2020)
     assert not (raw / "2020").exists()   # nothing for Bronze to read by mistake
+
+
+
+def test_zip_without_csv_fails(raw):
+    make_zip(raw, 2020, {"readme.txt": "x"})
+    assert not injection.land(2020)
+    assert not (raw / "2020").exists()
+
+
+def test_corrupt_zip_fails_and_is_deleted(raw):
+    with zipfile.ZipFile(raw / "2020.zip", "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr(A, os.urandom(3000).hex())
+    data = bytearray((raw / "2020.zip").read_bytes())
+    for i in range(45, 90):              # break the compressed data in the middle
+        data[i] ^= 0xFF
+    (raw / "2020.zip").write_bytes(data)
+
+    assert not injection.land(2020)      # no crash
+    assert not (raw / "2020.zip").exists()   # next run downloads it again
+    assert not (raw / "2020").exists()

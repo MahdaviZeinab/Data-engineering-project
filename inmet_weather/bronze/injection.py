@@ -13,6 +13,7 @@ import argparse
 import shutil
 import time
 import zipfile
+import zlib
 from pathlib import Path
 
 import requests
@@ -92,6 +93,9 @@ def unzip(year):
             sources[name] = member.filename
             (temporary / name).write_bytes(data)
 
+    if not sources:
+        raise RuntimeError(f"{year}: the zip has no CSV files. Check the zip by hand.")
+
     # Compare with the zip: one file per unique CSV name.
     written = count_csv(temporary)
     if written != len(sources):
@@ -125,7 +129,13 @@ def land(year):
         return False
     try:
         unzip(year)
-    except (RuntimeError, OSError, zipfile.BadZipFile) as error:
+    except (zipfile.BadZipFile, zlib.error) as error:
+        # The zip itself is broken: delete it, so the next run downloads it again.
+        print(f"{year}: broken zip ({error}). Deleted it; run again to download it.")
+        (FOLDER / f"{year}.zip").unlink(missing_ok=True)
+        return False
+    except (RuntimeError, OSError) as error:
+        # The zip is fine but its content is unexpected, or the disk failed.
         print(error)
         return False
     return True
