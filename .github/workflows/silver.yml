@@ -1,0 +1,39 @@
+# Silver run on the OpenStack VM (self-hosted runner).
+# For now (S1) it only profiles the Bronze tables; it does not change them.
+#
+# When does it run?
+#   - automatically after bronze-ingest finished successfully
+#   - by hand: Actions tab -> silver -> Run workflow
+name: silver
+
+on:
+  workflow_run:
+    workflows: [bronze-ingest]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      env:
+        description: "Lake environment"
+        type: choice
+        options: [prod, dev]
+        default: prod
+
+jobs:
+  silver:
+    # after Bronze: only if Bronze succeeded
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    runs-on: [self-hosted, linux, openstack]
+    env:
+      DATA_ROOT: /data/inmet
+      LAKE_ENV: ${{ inputs.env || 'prod' }}
+    defaults:
+      run:
+        working-directory: inmet_weather
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Profile Bronze (S1, read only)
+        env:
+          DAT535_OUTPUT_DIR: ${{ env.DATA_ROOT }}/lake/${{ env.LAKE_ENV }}
+        # same Python environment that the Bronze workflow made on the VM
+        run: $DATA_ROOT/venv/bin/python -m silver.profile_bronze --env "$LAKE_ENV"
