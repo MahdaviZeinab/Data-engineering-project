@@ -163,3 +163,42 @@ def test_one_failed_table_replaces_no_table(spark, source, tmp_path, monkeypatch
     for table in ["inmet_hourly", "inmet_quarantine", "inmet_files"]:
         ids = [r[0] for r in read(spark, out, table).select("_bronze_run_id").distinct().collect()]
         assert ids == ["good"], table
+
+
+
+
+def test_invalid_hour_does_not_hide_a_missing_hour(spark, tmp_path):
+    rows = hours(1)                                       # 24 good hours of 1 Jan
+    bad = rows[14].replace("1400 UTC", "2500 UTC")        # an hour that cannot exist
+    rows = rows[:14] + rows[15:] + [bad]                  # 1400 is missing, 2500 is extra
+    y = tmp_path / "src" / "2020"
+    write(y, "INMET_SE_SP_A001_SAO PAULO_01-01-2020_A_01-01-2020.CSV",
+          station("A001", "X") + [EXPECTED_HEADER + ";"] + rows)
+
+    out = str(tmp_path / "out")
+    run_bronze(spark, str(tmp_path / "src"), out, years=[2020])
+    f = read(spark, out, "inmet_files").first()
+
+    assert f["missing_hours"] == 1
+    assert f["status"] == "INCOMPLETE"
+    # Bronze keeps the raw text: the "2500 UTC" line is still there
+    hourly = read(spark, out, "inmet_hourly")
+    assert hourly.where("`Hora UTC` = '2500 UTC'").count() == 1
+
+
+
+def test_all_hours_but_other_problems_is_not_plain_complete(spark, tmp_path):
+    rows = hours(1)                                       # all 24 hours are there
+    rows = rows + [rows[5], "2020/01/01;0600 UTC;0;1"]    # + one duplicate + one broken line
+    y = tmp_path / "src" / "2020"
+    write(y, "INMET_SE_SP_A001_SAO PAULO_01-01-2020_A_01-01-2020.CSV",
+          station("A001", "X") + [EXPECTED_HEADER + ";"] + rows)
+
+    out = str(tmp_path / "out")
+    report = run_bronze(spark, str(tmp_path / "src"), out, years=[2020])
+    f = read(spark, out, "inmet_files").first()
+
+    assert f["missing_hours"] == 0
+    assert f["duplicate_rows"] == 1 and f["quarantined_lines"] == 1
+    assert f["status"] == "COMPLETE_WITH_ISSUES"
+    assert report["complete"] == 0 and report["complete_with_issues"] == 1
