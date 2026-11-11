@@ -2,6 +2,7 @@
 S1: profile the Bronze data before we clean it in Silver.
 
 This job only READS Bronze. It never changes, deletes or rewrites a Bronze table.
+Results are saved as small CSV files in <output>/silver/_profile/<table>/.
 
 Run (from the inmet_weather folder):
   python -m silver.profile_bronze                  # all years, dev
@@ -199,6 +200,45 @@ def station_changes(files):
             .orderBy("station_code"))
 
 
+# --------------------------------------------------------------------------
+# Step 6: save every result as a small CSV file in silver/_profile/
+# --------------------------------------------------------------------------
+def save(df, path):
+    """Write one small table as ONE CSV file with a header (easy to open later)."""
+    # CSV cannot store lists, so lists (e.g. the station names) become text
+    for name, kind in df.dtypes:
+        if kind.startswith("array"):
+            df = df.withColumn(name, F.col(name).cast("string"))
+    df.coalesce(1).write.mode("overwrite").option("header", True).csv(path)
+
+
+def run_profile(spark, hourly, files, profile_dir):
+    """Make every profile table, save it, then print it from the saved file."""
+    rows_per_year = (hourly.groupBy("source_year").agg(F.count("*").alias("hourly_rows"))
+                     .join(files.groupBy("source_year").agg(F.count("*").alias("files")),
+                           "source_year", "full")
+                     .orderBy("source_year"))
+    station_days = hours_per_station_day(hourly, files)
+
+    results = {
+        "bronze_rows_per_year": rows_per_year,               # step 2
+        "measurements": profile_measurements(hourly),        # step 3
+        "timestamp_formats": timestamp_formats(hourly),      # step 4
+        "timestamp_problems": timestamp_problems(hourly),    # step 4
+        "hours_histogram": hours_histogram(station_days),    # step 4
+        "stations_per_state": stations_per_state(files),     # step 5
+        "stations_per_year": stations_per_year(files),       # step 5
+        "station_changes": station_changes(files),           # step 5
+    }
+    for name, df in results.items():
+        path = f"{profile_dir}/{name}"
+        save(df, path)
+        # print from the saved file: small, and proves the file is readable
+        saved = spark.read.option("header", True).csv(path)
+        print(f"\n== {name}  ({saved.count()} rows)  -> {path}")
+        saved.show(30, truncate=False)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Profile the Bronze tables (read only).")
     parser.add_argument("--env", default="dev", choices=["dev", "prod"])
@@ -216,30 +256,7 @@ def main():
     spark.sparkContext.setLogLevel("WARN")
     try:
         hourly, files = read_bronze(spark, output, args.years)
-        # Quick check that both tables were read: rows per year.
-        print("inmet_hourly rows per year:")
-        hourly.groupBy("source_year").count().orderBy("source_year").show()
-        print("inmet_files rows per year:")
-        files.groupBy("source_year").count().orderBy("source_year").show()
-
-        print("Step 3: measurements per year:")
-        profile_measurements(hourly).show(200, truncate=False)
-
-        print("Step 4: timestamp formats:")
-        timestamp_formats(hourly).show(100, truncate=False)
-        print("Step 4: rows with a bad date or hour:")
-        timestamp_problems(hourly).show()
-        print("Step 4: station-days by number of hours (24 = complete, 0 = no data):")
-        station_days = hours_per_station_day(hourly, files)
-        hours_histogram(station_days).show(200)
-
-        print("Step 5: stations per state:")
-        stations_per_state(files).show(50)
-        print("Step 5: stations per year:")
-        stations_per_year(files).show()
-        changes = station_changes(files)
-        print("Step 5: stations whose name, state or position changed:", changes.count())
-        changes.show(20, truncate=False)
+        run_profile(spark, hourly, files, f"{output}/silver/_profile")
         return 0
     except Exception as error:
         print("PROFILE FAILED:", error)
