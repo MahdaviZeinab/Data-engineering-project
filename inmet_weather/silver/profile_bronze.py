@@ -86,6 +86,76 @@ def profile_measurements(hourly):
             .orderBy("measurement", "source_year"))
 
 
+# --------------------------------------------------------------------------
+# Step 4: timestamps and missing hours (UTC only; local time is S5)
+# --------------------------------------------------------------------------
+# What a correct value looks like. Anything else counts as a bad date / hour.
+DATE_PATTERN = r"^\d{4}[/-]\d{2}[/-]\d{2}$"                   # 2020/01/31 or 2020-01-31
+HOUR_PATTERN = r"^([01]\d|2[0-3])(00 UTC|:00)$"              # 0000 UTC ... 2300 UTC, or 00:00
+
+
+def add_utc_time(hourly):
+    """Add TEMPORARY utc_date and utc_hour columns (null when the text is bad)."""
+    date_text = F.regexp_replace("Data", "-", "/")
+    utc_date = F.when(F.col("Data").rlike(DATE_PATTERN), F.to_date(date_text, "yyyy/MM/dd"))
+    utc_hour = F.when(F.col("`Hora UTC`").rlike(HOUR_PATTERN),
+                      F.substring("`Hora UTC`", 1, 2).cast("int"))
+    return hourly.withColumn("utc_date", utc_date).withColumn("utc_hour", utc_hour)
+
+
+def timestamp_formats(hourly):
+    """
+    Which text formats appear in "Data" and "Hora UTC"? Every digit becomes 9,
+    so "2020/01/31" -> "9999/99/99" and "0100 UTC" -> "9999 UTC".
+    """
+    def formats(column):
+        return hourly.select("source_year", F.lit(column).alias("column"),
+                             F.regexp_replace(F.col(f"`{column}`"), r"\d", "9").alias("format"))
+    return (formats("Data").unionByName(formats("Hora UTC"))
+            .groupBy("source_year", "column", "format").count()
+            .orderBy("column", "source_year", F.desc("count")))
+
+
+def timestamp_problems(hourly):
+    """Per year: how many rows have a date or hour we cannot read."""
+    timed = add_utc_time(hourly)
+    return (timed.groupBy("source_year").agg(
+                F.count("*").alias("rows"),
+                F.sum(F.when(F.col("utc_date").isNull(), 1).otherwise(0)).alias("bad_date"),
+                F.sum(F.when(F.col("utc_hour").isNull(), 1).otherwise(0)).alias("bad_hour"))
+            .orderBy("source_year"))
+
+
+def hours_per_station_day(hourly, files):
+    """
+    One row per station and UTC day with the number of hours we have (0-24).
+    - distinct hours, so a duplicate row does not count twice;
+    - days with NO rows come from the file dates (start_date..end_date),
+      because a missing day does not appear in inmet_hourly at all.
+    """
+    observed = (add_utc_time(hourly)
+                .where(F.col("utc_date").isNotNull() & F.col("utc_hour").isNotNull())
+                .groupBy("station_code", "utc_date")
+                .agg(F.countDistinct("utc_hour").alias("hours")))
+
+    expected = (files.where(F.col("start_date").isNotNull() & F.col("end_date").isNotNull())
+                .select("station_code",
+                        F.explode(F.sequence("start_date", "end_date")).alias("utc_date"))
+                .distinct())
+
+    # full join: a day with data outside the file dates is also kept
+    return (expected.join(observed, ["station_code", "utc_date"], "full")
+            .fillna(0, ["hours"])
+            .withColumn("year", F.year("utc_date")))
+
+
+def hours_histogram(station_days):
+    """How many station-days have 24, 23, ..., 0 hours (per year)."""
+    return (station_days.groupBy("year", "hours").count()
+            .withColumnRenamed("count", "station_days")
+            .orderBy("year", F.desc("hours")))
+
+
 def main():
     parser = argparse.ArgumentParser(description="Profile the Bronze tables (read only).")
     parser.add_argument("--env", default="dev", choices=["dev", "prod"])
@@ -111,6 +181,14 @@ def main():
 
         print("Step 3: measurements per year:")
         profile_measurements(hourly).show(200, truncate=False)
+
+        print("Step 4: timestamp formats:")
+        timestamp_formats(hourly).show(100, truncate=False)
+        print("Step 4: rows with a bad date or hour:")
+        timestamp_problems(hourly).show()
+        print("Step 4: station-days by number of hours (24 = complete, 0 = no data):")
+        station_days = hours_per_station_day(hourly, files)
+        hours_histogram(station_days).show(200)
         return 0
     except Exception as error:
         print("PROFILE FAILED:", error)
