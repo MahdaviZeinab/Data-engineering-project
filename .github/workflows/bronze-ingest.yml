@@ -15,8 +15,8 @@
 name: bronze-ingest
 
 on:
-  push:
-    branches: [main]
+  #push:
+  #  branches: [main]
   workflow_dispatch:                   # "Run workflow" button in the Actions tab
     inputs:
       years:

@@ -2,11 +2,13 @@
 # For now (S1) it only profiles the Bronze tables; it does not change them.
 #
 # When does it run?
+#   - automatically after every push (any branch)
 #   - automatically after bronze-ingest finished successfully
 #   - by hand: Actions tab -> silver -> Run workflow
 name: silver
 
 on:
+  push:                               # every push, on any branch
   workflow_run:
     workflows: [bronze-ingest]
     types: [completed]
@@ -20,8 +22,8 @@ on:
 
 jobs:
   silver:
-    # after Bronze: only if Bronze succeeded
-    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    # after Bronze: only if Bronze succeeded (push and the button always run)
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
     runs-on: [self-hosted, linux, openstack]
     env:
       DATA_ROOT: /data/inmet
