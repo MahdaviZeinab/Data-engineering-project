@@ -156,6 +156,49 @@ def hours_histogram(station_days):
             .orderBy("year", F.desc("hours")))
 
 
+# --------------------------------------------------------------------------
+# Step 5: station information (from inmet_files, one row per file)
+# --------------------------------------------------------------------------
+def to_number(column):
+    """TEMPORARY number from Bronze text: "-15,78" -> -15.78 (null if not a number)."""
+    return F.expr(f"try_cast(regexp_replace(trim({column}), ',', '.') AS DOUBLE)")
+
+
+def stations_per_state(files):
+    """How many different stations each state has (all years together)."""
+    return (files.groupBy("state")
+            .agg(F.countDistinct("station_code").alias("stations"))
+            .orderBy(F.desc("stations")))
+
+
+def stations_per_year(files):
+    """How many different stations have a file in each year."""
+    return (files.groupBy("source_year")
+            .agg(F.countDistinct("station_code").alias("stations"))
+            .orderBy("source_year"))
+
+
+def station_changes(files):
+    """
+    One row per station whose name, state, latitude or longitude is not
+    the same in every year. Nothing is corrected here; we only look.
+    """
+    per_station = files.groupBy("station_code").agg(
+        F.sort_array(F.collect_set("source_year")).alias("years"),
+        F.collect_set(F.trim("station_name")).alias("names"),
+        F.collect_set(F.trim("state")).alias("states"),
+        # how far the station "moved" between years, in degrees
+        F.round(F.max(to_number("latitude")) - F.min(to_number("latitude")), 6).alias("lat_change"),
+        F.round(F.max(to_number("longitude")) - F.min(to_number("longitude")), 6).alias("lon_change"))
+
+    return (per_station
+            .withColumn("name_changed", F.size("names") > 1)
+            .withColumn("state_changed", F.size("states") > 1)
+            .withColumn("position_changed", (F.col("lat_change") > 0) | (F.col("lon_change") > 0))
+            .where("name_changed OR state_changed OR position_changed")
+            .orderBy("station_code"))
+
+
 def main():
     parser = argparse.ArgumentParser(description="Profile the Bronze tables (read only).")
     parser.add_argument("--env", default="dev", choices=["dev", "prod"])
@@ -189,6 +232,14 @@ def main():
         print("Step 4: station-days by number of hours (24 = complete, 0 = no data):")
         station_days = hours_per_station_day(hourly, files)
         hours_histogram(station_days).show(200)
+
+        print("Step 5: stations per state:")
+        stations_per_state(files).show(50)
+        print("Step 5: stations per year:")
+        stations_per_year(files).show()
+        changes = station_changes(files)
+        print("Step 5: stations whose name, state or position changed:", changes.count())
+        changes.show(20, truncate=False)
         return 0
     except Exception as error:
         print("PROFILE FAILED:", error)
