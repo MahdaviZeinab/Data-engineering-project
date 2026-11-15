@@ -64,9 +64,38 @@ def count_not_numeric(df):
     return df.agg(*counts).first().asDict()
 
 
-def make_time(df):
-    """Silver 5: Data + Hora UTC -> observed_at_utc; add timezone and local time."""
-    return df
+def station_timezones(files):
+    """Silver 5: find the time zone of each station.
+    First check the station list, if it's not there use the state's zone."""
+    spark = files.sparkSession
+    by_state = spark.createDataFrame(list(contract.STATE_TIMEZONE.items()), "state string, state_tz string")
+    by_station = spark.createDataFrame(list(contract.STATION_TIMEZONE_OVERRIDE.items()),
+                                       "station_code string, station_tz string")
+    return (files.select("station_code", F.upper(F.trim("state")).alias("state"))
+                 .dropDuplicates(["station_code"])
+                 .join(by_state, "state", "left")
+                 .join(by_station, "station_code", "left")
+                 .select("station_code", F.coalesce("station_tz", "state_tz").alias("timezone")))
+
+
+def make_time(df, files):
+    """Silver 5: make the UTC time and the station's local time.
+    Bad rows are kept and marked in dq_issue. Silver 9 moves them out later."""
+    day = F.regexp_replace("Data", "-", "/")                  # same date format for all
+    hhmm = F.regexp_replace("Hora UTC", "[^0-9]", "")         # keep only the digits, "0000"
+    utc = F.when(hhmm.rlike("^([01][0-9]|2[0-3])[0-5][0-9]$"),   # hour must be 00-23
+                 F.to_timestamp(F.concat_ws(" ", day, hhmm), "yyyy/MM/dd HHmm"))
+
+    # add the time zone, then turn UTC into local time
+    df = (df.withColumn("observed_at_utc", utc)
+            .join(F.broadcast(station_timezones(files)), "station_code", "left")
+            .withColumn("local_time", F.from_utc_timestamp("observed_at_utc", F.col("timezone")))
+            .withColumn("local_date", F.to_date("local_time"))
+            .withColumn("local_hour", F.hour("local_time")))
+    # mark rows we can't use
+    return df.withColumn("dq_issue",
+                         F.when(F.col("observed_at_utc").isNull(), "bad_timestamp")
+                          .when(F.col("timezone").isNull(), "unknown_timezone"))
 
 
 def remove_duplicates(df):
@@ -99,7 +128,7 @@ def run_silver(spark, output, years=None, run_id=None):
     df = check_schema(hourly)
     print("Values that are not numbers:", count_not_numeric(df))
     df = cast_values(df)
-    df = make_time(df)
+    df = make_time(df, files)
     df = remove_duplicates(df)
     df = apply_value_rules(df)
     df = quarantine_rows(df)
