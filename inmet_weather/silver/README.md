@@ -81,3 +81,25 @@ These are start values. Update them with the S1 percentiles.
 
 **Why:** Brazil has four time zones. With UTC−3 for all, rain in Acre or Mato Grosso can land on the wrong day.
 Stations in western Amazonas (UTC−5) or Fernando de Noronha (UTC−2) go in `STATION_TIMEZONE_OVERRIDE`.
+
+## Stations (Silver 7, [`stations.py`](stations.py))
+
+Every INMET file starts with 8 lines about the station (name, state, latitude, ...).
+Bronze keeps them in `bronze/inmet_files` (one row per file = one station, one year).
+
+| Table | One row = | What it holds |
+|---|---|---|
+| `silver/station_history` | one station, one year | station info as that year's file said it, plus `name_changed`, `location_changed`, `in_brazil`, `timezone` |
+| `silver/station` | one station | the latest info, plus `first_year`, `last_year`, `years`, `name_changes`, `location_changes` |
+
+| Rule | Value | Why |
+|---|---|---|
+| numbers | `,` → `.`, `-9999`/`""` → null | same as the hourly values |
+| two files for one station in one year | keep the one with the latest `end_date` | one row per station per year |
+| `name_changed` | name differs from the year before (case and spaces ignored) | track renames |
+| `location_changed` | latitude/longitude moved > `LOCATION_TOLERANCE_DEG` (0.001° ≈ 100 m) or altitude > `ALTITUDE_TOLERANCE_M` (1 m) | small differences are only rounding |
+| `timezone` | `STATION_TIMEZONE_OVERRIDE`, else `STATE_TIMEZONE` | same rule as Silver 5 |
+| `in_brazil` | inside `BRAZIL_BOX` (incl. islands); no coordinates → false | finds wrong coordinates, e.g. a lost minus sign |
+
+The station tables are small, so they are always built from **all** years, also when the job runs with `--years`.
+They run at the end of `silver_build`, or alone with `python -m silver.stations`.
