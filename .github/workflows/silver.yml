@@ -38,6 +38,11 @@ jobs:
       - name: Run the tests
         run: $DATA_ROOT/venv/bin/python -m pytest -q
 
+      - name: Free memory on the VM (Spark needs it)
+        run: |
+          free -h
+          ps aux | grep -i [j]ava || echo "no other Java/Spark running"
+
       - name: Build Silver (2023, 2024, 2025)
         env:
           DAT535_OUTPUT_DIR: ${{ env.DATA_ROOT }}/lake/${{ env.LAKE_ENV }}

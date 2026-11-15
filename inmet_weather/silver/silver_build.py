@@ -152,8 +152,10 @@ def main():
              .getOrCreate())
     spark.sparkContext.setLogLevel("WARN")
     try:
-        silver = run_silver(spark, output, args.years)
-        print("SILVER rows:", silver.count())       # writing comes with S0/S10
+        # One year at a time, so Spark never holds 3 years at once (less memory).
+        for year in args.years or [None]:            # no --years: all years together
+            silver = run_silver(spark, output, [year] if year else None)
+            print("SILVER rows", year or "all years", ":", silver.count())   # writing comes with S0/S10
         return 0
     except Exception as error:
         print("SILVER FAILED:", error)
