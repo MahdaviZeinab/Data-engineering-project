@@ -17,6 +17,7 @@ from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql.window import Window
 
+from common.publish import has_columns, not_empty, publish
 from silver import contract
 
 
@@ -167,15 +168,25 @@ def main():
     output = os.environ.get("DAT535_OUTPUT_DIR") or str(project / "data" / "lake" / args.env)
 
     spark = (SparkSession.builder.appName("inmet-silver")
-             .config("spark.driver.memory", "4g")
+             .config("spark.driver.memory", "2g")   # VM has 8 GB, shared with other programs
              .config("spark.sql.session.timeZone", "UTC")
              .getOrCreate())
     spark.sparkContext.setLogLevel("WARN")
     try:
-        # One year at a time, so Spark never holds 3 years at once (less memory).
-        for year in args.years or [None]:            # no --years: all years together
-            silver = run_silver(spark, output, [year] if year else None)
-            print("SILVER rows", year or "all years", ":", silver.count())   # writing comes with S0/S10
+        run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        silver = run_silver(spark, output, args.years, run_id)
+        table = f"{output}/silver/inmet_hourly"
+        rows = publish(spark, silver, table, run_id, partition_by="source_year",
+                       checks=[not_empty, has_columns(*contract.KEY, *contract.MEASUREMENTS)])
+
+        # show the result in the log
+        print("SILVER published to", table)
+        print("SILVER rows per year:", rows)
+        result = spark.read.parquet(table)
+        result.select("station_code", "observed_at_utc", "local_time", "timezone",
+                      "temp_c", "humidity_pct", "precip_mm", "dq_issue", "source_year") \
+              .show(10, truncate=False)
+        result.groupBy("dq_issue").count().show()
         return 0
     except Exception as error:
         print("SILVER FAILED:", error)
