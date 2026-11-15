@@ -1,5 +1,5 @@
 # Silver run on the OpenStack VM (self-hosted runner).
-# For now (S1) it only profiles the Bronze tables; it does not change them.
+# 1. run the tests   2. if they pass, build Silver for the last 3 years (2023-2025).
 #
 # When does it run?
 #   - automatically after every push (any branch)
@@ -34,8 +34,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Profile Bronze (S1, read only)
+      # same Python environment that the Bronze workflow made on the VM
+      - name: Run the tests
+        run: $DATA_ROOT/venv/bin/python -m pytest -q
+
+      - name: Build Silver (2023, 2024, 2025)
         env:
           DAT535_OUTPUT_DIR: ${{ env.DATA_ROOT }}/lake/${{ env.LAKE_ENV }}
-        # same Python environment that the Bronze workflow made on the VM
-        run: $DATA_ROOT/venv/bin/python -m silver.profile_bronze --env "$LAKE_ENV"
+        run: $DATA_ROOT/venv/bin/python -m silver.silver_build --env "$LAKE_ENV" --years 2023 2024 2025
