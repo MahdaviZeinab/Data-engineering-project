@@ -15,6 +15,7 @@ from pathlib import Path
 
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
+from pyspark.sql.window import Window
 
 from silver import contract
 
@@ -98,9 +99,27 @@ def make_time(df, files):
                           .when(F.col("timezone").isNull(), "unknown_timezone"))
 
 
+def count_duplicates(df):
+    """Silver 6: how many extra rows have the same KEY (station + hour). Like Lab 3."""
+    rows = df.where(F.col("observed_at_utc").isNotNull()).select(contract.KEY)
+    return rows.count() - rows.distinct().count()
+
+
 def remove_duplicates(df):
-    """Silvre 6: keep one row per KEY."""
-    return df
+    """Silver 6: keep one row per KEY (station + hour), the best one:
+    1. date is in the right year (same as source_year)
+    2. fewer missing values
+    3. newest Bronze record
+    Rows without observed_at_utc are kept; Silver 9 handles them."""
+    right_year = (F.year("observed_at_utc") == F.col("source_year")).cast("int")
+    missing = sum(F.col(c).isNull().cast("int") for c in contract.MEASUREMENTS)
+
+    best_first = Window.partitionBy(*contract.KEY).orderBy(
+        right_year.desc(), missing.asc(), F.col("_bronze_ingestion_time").desc())
+
+    df = df.withColumn("row_num", F.row_number().over(best_first))
+    keep = (F.col("row_num") == 1) | F.col("observed_at_utc").isNull()
+    return df.where(keep).drop("row_num")
 
 
 def apply_value_rules(df):
@@ -129,6 +148,7 @@ def run_silver(spark, output, years=None, run_id=None):
     print("Values that are not numbers:", count_not_numeric(df))
     df = cast_values(df)
     df = make_time(df, files)
+    print("Duplicates removed:", count_duplicates(df))
     df = remove_duplicates(df)
     df = apply_value_rules(df)
     df = quarantine_rows(df)

@@ -1,9 +1,11 @@
 """Tests for the Silver job skeleton (S3), with a tiny fake Bronze table."""
 import pytest
 from pyspark.sql import SparkSession
+from pyspark.sql import functions as F
 
 from silver.contract import BRONZE_COLUMNS, MEASUREMENTS
-from silver.silver_build import cast_values, count_not_numeric, make_time, run_silver
+from silver.silver_build import (cast_values, count_duplicates, count_not_numeric, make_time,
+                                 remove_duplicates, run_silver)
 
 TEMP = "TEMPERATURA DO AR - BULBO SECO, HORARIA (°C)"   # becomes temp_c
 
@@ -101,3 +103,59 @@ def test_bad_time_and_unknown_zone_get_a_reason(spark):
                    stations(spark))
     issues = sorted((r.dq_issue or "ok") for r in df.collect())
     assert issues == ["bad_timestamp", "bad_timestamp", "ok", "unknown_timezone"]
+
+
+# ---------------------------------------------------------------- Silver 6: duplicates
+def dup_rows(spark, rows):
+    """Fake rows after Silver 5: (station, UTC time, source_year, temp_c, ingestion time).
+    All other measurements are 1.0, so only temp_c decides 'fewer missing values'."""
+    others = [m for m in MEASUREMENTS if m != "temp_c"]
+    full = [(*row, *[1.0] * len(others)) for row in rows]
+    schema = ("station_code string, observed_at_utc string, source_year int, temp_c double, "
+              "_bronze_ingestion_time string, " + ", ".join(f"{m} double" for m in others))
+    return spark.createDataFrame(full, schema).withColumn(
+        "observed_at_utc", F.to_timestamp("observed_at_utc"))
+
+
+H = "2021-01-01 05:00:00"
+
+
+def test_one_row_per_station_and_hour(spark):
+    df = remove_duplicates(dup_rows(spark, [("A1", H, 2021, 25.0, "t1"),
+                                            ("A1", H, 2021, 25.0, "t1"),
+                                            ("B1", H, 2021, 25.0, "t1")]))   # other station
+    assert df.count() == 2
+
+
+def test_keeps_fewer_missing_values(spark):
+    df = remove_duplicates(dup_rows(spark, [("A1", H, 2021, None, "t2"),
+                                            ("A1", H, 2021, 25.0, "t1")]))
+    assert df.first()["temp_c"] == 25.0
+
+
+def test_keeps_right_year_first(spark):
+    # the row from the 2020 file is wrong, even with fewer missing values
+    df = remove_duplicates(dup_rows(spark, [("A1", H, 2020, 25.0, "t2"),
+                                            ("A1", H, 2021, None, "t1")]))
+    assert df.first()["source_year"] == 2021
+
+
+def test_keeps_newest_record(spark):
+    df = remove_duplicates(dup_rows(spark, [("A1", H, 2021, 20.0, "2024-01-01"),
+                                            ("A1", H, 2021, 30.0, "2025-01-01")]))
+    assert df.first()["temp_c"] == 30.0
+
+
+def test_rows_without_time_are_kept(spark):
+    df = remove_duplicates(dup_rows(spark, [("A1", None, 2021, 25.0, "t1"),
+                                            ("A1", None, 2021, 25.0, "t1")]))
+    assert df.count() == 2              # Silver 9 deals with them
+
+
+def test_count_duplicates(spark):
+    df = dup_rows(spark, [("A1", H, 2021, 25.0, "t1"),
+                          ("A1", H, 2021, 25.0, "t1"),
+                          ("A1", H, 2021, 25.0, "t1"),
+                          ("B1", H, 2021, 25.0, "t1"),
+                          ("A1", None, 2021, 25.0, "t1")])
+    assert count_duplicates(df) == 2    # 3 rows of A1 at 05:00 -> 2 extra
