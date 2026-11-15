@@ -2,6 +2,7 @@
 S1: profile the Bronze data before we clean it in Silver.
 
 This job only READS Bronze. It never changes, deletes or rewrites a Bronze table.
+Results are saved as small CSV files in <output>/silver/_profile/<table>/.
 
 Run (from the inmet_weather folder):
   python -m silver.profile_bronze                  # all years, dev
@@ -86,6 +87,158 @@ def profile_measurements(hourly):
             .orderBy("measurement", "source_year"))
 
 
+# --------------------------------------------------------------------------
+# Step 4: timestamps and missing hours (UTC only; local time is S5)
+# --------------------------------------------------------------------------
+# What a correct value looks like. Anything else counts as a bad date / hour.
+DATE_PATTERN = r"^\d{4}[/-]\d{2}[/-]\d{2}$"                   # 2020/01/31 or 2020-01-31
+HOUR_PATTERN = r"^([01]\d|2[0-3])(00 UTC|:00)$"              # 0000 UTC ... 2300 UTC, or 00:00
+
+
+def add_utc_time(hourly):
+    """Add TEMPORARY utc_date and utc_hour columns (null when the text is bad)."""
+    date_text = F.regexp_replace("Data", "-", "/")
+    utc_date = F.when(F.col("Data").rlike(DATE_PATTERN), F.to_date(date_text, "yyyy/MM/dd"))
+    utc_hour = F.when(F.col("`Hora UTC`").rlike(HOUR_PATTERN),
+                      F.substring("`Hora UTC`", 1, 2).cast("int"))
+    return hourly.withColumn("utc_date", utc_date).withColumn("utc_hour", utc_hour)
+
+
+def timestamp_formats(hourly):
+    """
+    Which text formats appear in "Data" and "Hora UTC"? Every digit becomes 9,
+    so "2020/01/31" -> "9999/99/99" and "0100 UTC" -> "9999 UTC".
+    """
+    def formats(column):
+        return hourly.select("source_year", F.lit(column).alias("column"),
+                             F.regexp_replace(F.col(f"`{column}`"), r"\d", "9").alias("format"))
+    return (formats("Data").unionByName(formats("Hora UTC"))
+            .groupBy("source_year", "column", "format").count()
+            .orderBy("column", "source_year", F.desc("count")))
+
+
+def timestamp_problems(hourly):
+    """Per year: how many rows have a date or hour we cannot read."""
+    timed = add_utc_time(hourly)
+    return (timed.groupBy("source_year").agg(
+                F.count("*").alias("rows"),
+                F.sum(F.when(F.col("utc_date").isNull(), 1).otherwise(0)).alias("bad_date"),
+                F.sum(F.when(F.col("utc_hour").isNull(), 1).otherwise(0)).alias("bad_hour"))
+            .orderBy("source_year"))
+
+
+def hours_per_station_day(hourly, files):
+    """
+    One row per station and UTC day with the number of hours we have (0-24).
+    - distinct hours, so a duplicate row does not count twice;
+    - days with NO rows come from the file dates (start_date..end_date),
+      because a missing day does not appear in inmet_hourly at all.
+    """
+    observed = (add_utc_time(hourly)
+                .where(F.col("utc_date").isNotNull() & F.col("utc_hour").isNotNull())
+                .groupBy("station_code", "utc_date")
+                .agg(F.countDistinct("utc_hour").alias("hours")))
+
+    expected = (files.where(F.col("start_date").isNotNull() & F.col("end_date").isNotNull())
+                .select("station_code",
+                        F.explode(F.sequence("start_date", "end_date")).alias("utc_date"))
+                .distinct())
+
+    # full join: a day with data outside the file dates is also kept
+    return (expected.join(observed, ["station_code", "utc_date"], "full")
+            .fillna(0, ["hours"])
+            .withColumn("year", F.year("utc_date")))
+
+
+def hours_histogram(station_days):
+    """How many station-days have 24, 23, ..., 0 hours (per year)."""
+    return (station_days.groupBy("year", "hours").count()
+            .withColumnRenamed("count", "station_days")
+            .orderBy("year", F.desc("hours")))
+
+
+# --------------------------------------------------------------------------
+# Step 5: station information (from inmet_files, one row per file)
+# --------------------------------------------------------------------------
+def to_number(column):
+    """TEMPORARY number from Bronze text: "-15,78" -> -15.78 (null if not a number)."""
+    return F.expr(f"try_cast(regexp_replace(trim({column}), ',', '.') AS DOUBLE)")
+
+
+def stations_per_state(files):
+    """How many different stations each state has (all years together)."""
+    return (files.groupBy("state")
+            .agg(F.countDistinct("station_code").alias("stations"))
+            .orderBy(F.desc("stations")))
+
+
+def stations_per_year(files):
+    """How many different stations have a file in each year."""
+    return (files.groupBy("source_year")
+            .agg(F.countDistinct("station_code").alias("stations"))
+            .orderBy("source_year"))
+
+
+def station_changes(files):
+    """
+    One row per station whose name, state, latitude or longitude is not
+    the same in every year. Nothing is corrected here; we only look.
+    """
+    per_station = files.groupBy("station_code").agg(
+        F.sort_array(F.collect_set("source_year")).alias("years"),
+        F.collect_set(F.trim("station_name")).alias("names"),
+        F.collect_set(F.trim("state")).alias("states"),
+        # how far the station "moved" between years, in degrees
+        F.round(F.max(to_number("latitude")) - F.min(to_number("latitude")), 6).alias("lat_change"),
+        F.round(F.max(to_number("longitude")) - F.min(to_number("longitude")), 6).alias("lon_change"))
+
+    return (per_station
+            .withColumn("name_changed", F.size("names") > 1)
+            .withColumn("state_changed", F.size("states") > 1)
+            .withColumn("position_changed", (F.col("lat_change") > 0) | (F.col("lon_change") > 0))
+            .where("name_changed OR state_changed OR position_changed")
+            .orderBy("station_code"))
+
+
+# --------------------------------------------------------------------------
+# Step 6: save every result as a small CSV file in silver/_profile/
+# --------------------------------------------------------------------------
+def save(df, path):
+    """Write one small table as ONE CSV file with a header (easy to open later)."""
+    # CSV cannot store lists, so lists (e.g. the station names) become text
+    for name, kind in df.dtypes:
+        if kind.startswith("array"):
+            df = df.withColumn(name, F.col(name).cast("string"))
+    df.coalesce(1).write.mode("overwrite").option("header", True).csv(path)
+
+
+def run_profile(spark, hourly, files, profile_dir):
+    """Make every profile table, save it, then print it from the saved file."""
+    rows_per_year = (hourly.groupBy("source_year").agg(F.count("*").alias("hourly_rows"))
+                     .join(files.groupBy("source_year").agg(F.count("*").alias("files")),
+                           "source_year", "full")
+                     .orderBy("source_year"))
+    station_days = hours_per_station_day(hourly, files)
+
+    results = {
+        "bronze_rows_per_year": rows_per_year,               # step 2
+        "measurements": profile_measurements(hourly),        # step 3
+        "timestamp_formats": timestamp_formats(hourly),      # step 4
+        "timestamp_problems": timestamp_problems(hourly),    # step 4
+        "hours_histogram": hours_histogram(station_days),    # step 4
+        "stations_per_state": stations_per_state(files),     # step 5
+        "stations_per_year": stations_per_year(files),       # step 5
+        "station_changes": station_changes(files),           # step 5
+    }
+    for name, df in results.items():
+        path = f"{profile_dir}/{name}"
+        save(df, path)
+        # print from the saved file: small, and proves the file is readable
+        saved = spark.read.option("header", True).csv(path)
+        print(f"\n== {name}  ({saved.count()} rows)  -> {path}")
+        saved.show(30, truncate=False)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Profile the Bronze tables (read only).")
     parser.add_argument("--env", default="dev", choices=["dev", "prod"])
@@ -103,14 +256,7 @@ def main():
     spark.sparkContext.setLogLevel("WARN")
     try:
         hourly, files = read_bronze(spark, output, args.years)
-        # Quick check that both tables were read: rows per year.
-        print("inmet_hourly rows per year:")
-        hourly.groupBy("source_year").count().orderBy("source_year").show()
-        print("inmet_files rows per year:")
-        files.groupBy("source_year").count().orderBy("source_year").show()
-
-        print("Step 3: measurements per year:")
-        profile_measurements(hourly).show(200, truncate=False)
+        run_profile(spark, hourly, files, f"{output}/silver/_profile")
         return 0
     except Exception as error:
         print("PROFILE FAILED:", error)
