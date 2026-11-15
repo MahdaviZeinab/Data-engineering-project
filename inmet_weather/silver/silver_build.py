@@ -38,10 +38,30 @@ def check_schema(df):
     contract.check_schema(df.columns)
     return df
 
+#issue #7: cast values to double, with ',' -> '.' and MISSING_CODES -> null
+def to_text(bronze_name):
+    """Bronze text, trimmed, with ',' -> '.' (so "25,5" -> "25.5" and ",8" -> ".8")."""
+    return F.regexp_replace(F.trim(F.col(f"`{bronze_name}`")), ",", ".")
+
 
 def cast_values(df):
     """Silver 4: rename with RENAME; MISSING_CODES -> null; ',' -> '.'; cast to double."""
+    for bronze_name, silver_name in contract.RENAME.items():
+        text = to_text(bronze_name)
+        number = F.when(text.isin(contract.MISSING_CODES), None).otherwise(text.cast("double"))
+        df = df.withColumn(silver_name, number).drop(bronze_name)
     return df
+#--------------------------------------------------------------------------
+
+
+def count_not_numeric(df):
+    """Silver 4: per measurement, how many Bronze values are text that is not a number."""
+    counts = []
+    for bronze_name, silver_name in contract.RENAME.items():
+        text = to_text(bronze_name)
+        bad = text.isNotNull() & ~text.isin(contract.MISSING_CODES) & text.cast("double").isNull()
+        counts.append(F.sum(bad.cast("int")).alias(silver_name))
+    return df.agg(*counts).first().asDict()
 
 
 def make_time(df):
@@ -77,6 +97,7 @@ def run_silver(spark, output, years=None, run_id=None):
     hourly, files = read_bronze(spark, output, years)
 
     df = check_schema(hourly)
+    print("Values that are not numbers:", count_not_numeric(df))
     df = cast_values(df)
     df = make_time(df)
     df = remove_duplicates(df)
