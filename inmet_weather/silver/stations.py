@@ -23,11 +23,11 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql.window import Window
 
 from common.publish import has_columns, not_empty, publish
+from common.spark import start_spark
 from silver import contract
 
 
@@ -131,7 +131,7 @@ def latest_station(history):
 # The whole step: read Bronze, build, publish
 # --------------------------------------------------------------------------
 def build_stations(spark, output, run_id):
-    files = spark.read.parquet(f"{output}/bronze/inmet_files")      # all years, on purpose
+    files = spark.table("bronze.inmet_files")      # all years, on purpose
     history = station_history(files).withColumn("_silver_run_id", F.lit(run_id)).cache()
     latest = latest_station(history)
 
@@ -172,11 +172,7 @@ def main():
     project = Path(__file__).resolve().parents[1]          # the inmet_weather folder
     output = os.environ.get("DAT535_OUTPUT_DIR") or str(project / "data" / "lake" / args.env)
 
-    spark = (SparkSession.builder.appName("inmet-silver-stations")
-             .config("spark.driver.memory", "2g")
-             .config("spark.sql.session.timeZone", "UTC")
-             .getOrCreate())
-    spark.sparkContext.setLogLevel("WARN")
+    spark = start_spark("inmet-silver-stations", output, memory="2g")
     try:
         build_stations(spark, output, datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ"))
         return 0

@@ -13,21 +13,21 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql.window import Window
 
 from common.publish import has_columns, not_empty, publish
+from common.spark import start_spark
 from silver import contract
 from silver.stations import build_stations
 
 
 # Read Bronze
 # --------------------------------------------------------------------------
-def read_bronze(spark, output, years=None):
-    """Return (hourly, files) from <output>/bronze. All years unless --years is given."""
-    hourly = spark.read.parquet(f"{output}/bronze/inmet_hourly")
-    files = spark.read.parquet(f"{output}/bronze/inmet_files")
+def read_bronze(spark, years=None):
+    """Return (hourly, files) from the Bronze Spark tables. All years unless --years is given."""
+    hourly = spark.table("bronze.inmet_hourly")
+    files = spark.table("bronze.inmet_files")
     if years:
         hourly = hourly.where(F.col("source_year").isin(years))
         files = files.where(F.col("source_year").isin(years))
@@ -84,8 +84,8 @@ def station_timezones(files):
 def make_time(df, files):
     """Silver 5: make the UTC time and the station's local time.
     Bad rows are kept and marked in dq_issue. Silver 9 moves them out later."""
-    day = F.regexp_replace("Data", "-", "/")                  # same date format for all
-    hhmm = F.regexp_replace("Hora UTC", "[^0-9]", "")         # keep only the digits, "0000"
+    day = F.regexp_replace("data", "-", "/")                  # same date format for all
+    hhmm = F.regexp_replace("hora_utc", "[^0-9]", "")         # keep only the digits, "0000"
     utc = F.when(hhmm.rlike("^([01][0-9]|2[0-3])[0-5][0-9]$"),   # hour must be 00-23
                  F.to_timestamp(F.concat_ws(" ", day, hhmm), "yyyy/MM/dd HHmm"))
 
@@ -142,9 +142,9 @@ def add_station(df, files):
 # --------------------------------------------------------------------------
 # The whole job
 # --------------------------------------------------------------------------
-def run_silver(spark, output, years=None, run_id=None):
+def run_silver(spark, years=None, run_id=None):
     run_id = run_id or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    hourly, files = read_bronze(spark, output, years)
+    hourly, files = read_bronze(spark, years)
 
     df = check_schema(hourly)
     print("Values that are not numbers:", count_not_numeric(df))
@@ -168,14 +168,10 @@ def main():
     project = Path(__file__).resolve().parents[1]          # the inmet_weather folder
     output = os.environ.get("DAT535_OUTPUT_DIR") or str(project / "data" / "lake" / args.env)
 
-    spark = (SparkSession.builder.appName("inmet-silver")
-             .config("spark.driver.memory", "2g")   # VM has 8 GB, shared with other programs
-             .config("spark.sql.session.timeZone", "UTC")
-             .getOrCreate())
-    spark.sparkContext.setLogLevel("WARN")
+    spark = start_spark("inmet-silver", output, memory="2g")   # VM has 8 GB, shared with other programs
     try:
         run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        silver = run_silver(spark, output, args.years, run_id)
+        silver = run_silver(spark, args.years, run_id)
         table = f"{output}/silver/inmet_hourly"
         rows = publish(spark, silver, table, run_id, partition_by="source_year",
                        checks=[not_empty, has_columns(*contract.KEY, *contract.MEASUREMENTS)])

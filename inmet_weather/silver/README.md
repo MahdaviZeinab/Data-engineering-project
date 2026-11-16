@@ -1,6 +1,6 @@
 # Silver layer
 
-Reads `data/lake/<env>/bronze/` and writes `data/lake/<env>/silver/`.
+Reads the Spark tables `bronze.inmet_hourly` and `bronze.inmet_files` (with `spark.table`) and writes `data/lake/<env>/silver/`.
 One row in `silver/weather_hourly` = one station, one hour.
 
 All rules live in [`contract.py`](contract.py). The job reads them from there, so this README and the code agree.
@@ -23,24 +23,24 @@ A missing or new column stops the job with a clear error.
 
 | Bronze (Portuguese) | Silver (English) | Type | Unit |
 |---|---|---|---|
-| `Data` + `Hora UTC` | `observed_at_utc` | timestamp | UTC |
-| `PRECIPITAÇÃO TOTAL, HORÁRIO (mm)` | `precip_mm` | double | mm |
-| `PRESSAO ATMOSFERICA AO NIVEL DA ESTACAO, HORARIA (mB)` | `pressure_mb` | double | mB |
-| `PRESSÃO ATMOSFERICA MAX.NA HORA ANT. (AUT) (mB)` | `pressure_max_mb` | double | mB |
-| `PRESSÃO ATMOSFERICA MIN. NA HORA ANT. (AUT) (mB)` | `pressure_min_mb` | double | mB |
-| `RADIACAO GLOBAL (Kj/m²)` | `radiation_kj_m2` | double | kJ/m² |
-| `TEMPERATURA DO AR - BULBO SECO, HORARIA (°C)` | `temp_c` | double | °C |
-| `TEMPERATURA DO PONTO DE ORVALHO (°C)` | `dew_point_c` | double | °C |
-| `TEMPERATURA MÁXIMA NA HORA ANT. (AUT) (°C)` | `temp_max_c` | double | °C |
-| `TEMPERATURA MÍNIMA NA HORA ANT. (AUT) (°C)` | `temp_min_c` | double | °C |
-| `TEMPERATURA ORVALHO MAX. NA HORA ANT. (AUT) (°C)` | `dew_point_max_c` | double | °C |
-| `TEMPERATURA ORVALHO MIN. NA HORA ANT. (AUT) (°C)` | `dew_point_min_c` | double | °C |
-| `UMIDADE REL. MAX. NA HORA ANT. (AUT) (%)` | `humidity_max_pct` | double | % |
-| `UMIDADE REL. MIN. NA HORA ANT. (AUT) (%)` | `humidity_min_pct` | double | % |
-| `UMIDADE RELATIVA DO AR, HORARIA (%)` | `humidity_pct` | double | % |
-| `VENTO, DIREÇÃO HORARIA (gr) (° (gr))` | `wind_dir_deg` | double | degrees |
-| `VENTO, RAJADA MAXIMA (m/s)` | `wind_gust_ms` | double | m/s |
-| `VENTO, VELOCIDADE HORARIA (m/s)` | `wind_speed_ms` | double | m/s |
+| `data` + `hora_utc` | `observed_at_utc` | timestamp | UTC |
+| `precipitacao_total_mm` | `precip_mm` | double | mm |
+| `pressao_estacao_mb` | `pressure_mb` | double | mB |
+| `pressao_max_mb` | `pressure_max_mb` | double | mB |
+| `pressao_min_mb` | `pressure_min_mb` | double | mB |
+| `radiacao_global_kj_m2` | `radiation_kj_m2` | double | kJ/m² |
+| `temperatura_ar_c` | `temp_c` | double | °C |
+| `temperatura_orvalho_c` | `dew_point_c` | double | °C |
+| `temperatura_max_c` | `temp_max_c` | double | °C |
+| `temperatura_min_c` | `temp_min_c` | double | °C |
+| `temperatura_orvalho_max_c` | `dew_point_max_c` | double | °C |
+| `temperatura_orvalho_min_c` | `dew_point_min_c` | double | °C |
+| `umidade_max_pct` | `humidity_max_pct` | double | % |
+| `umidade_min_pct` | `humidity_min_pct` | double | % |
+| `umidade_relativa_pct` | `humidity_pct` | double | % |
+| `vento_direcao_graus` | `wind_dir_deg` | double | degrees |
+| `vento_rajada_ms` | `wind_gust_ms` | double | m/s |
+| `vento_velocidade_ms` | `wind_speed_ms` | double | m/s |
 
 **Why English names:** short, no spaces or accents, easy to use in Gold and SQL.
 
@@ -85,7 +85,7 @@ Stations in western Amazonas (UTC−5) or Fernando de Noronha (UTC−2) go in `S
 ## Stations (Silver 7, [`stations.py`](stations.py))
 
 Every INMET file starts with 8 lines about the station (name, state, latitude, ...).
-Bronze keeps them in `bronze/inmet_files` (one row per file = one station, one year).
+Bronze keeps them in the table `bronze.inmet_files` (one row per file = one station, one year).
 
 | Table | One row = | What it holds |
 |---|---|---|

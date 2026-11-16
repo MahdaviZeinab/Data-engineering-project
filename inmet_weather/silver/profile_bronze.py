@@ -15,12 +15,12 @@ import os
 import sys
 from pathlib import Path
 
-from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 
 from bronze.bronze_ingest import COLUMNS
+from common.spark import start_spark
 
-# The 17 weather measurements = every Bronze column except "Data" and "Hora UTC".
+# The 17 weather measurements = every Bronze column except "data" and "hora_utc".
 MEASUREMENTS = COLUMNS[2:]
 MISSING_CODE = -9999   # INMET writes -9999 for "no value"
 
@@ -28,11 +28,10 @@ MISSING_CODE = -9999   # INMET writes -9999 for "no value"
 # --------------------------------------------------------------------------
 # Step 2: read the two Bronze tables
 # --------------------------------------------------------------------------
-def read_bronze(spark, output, years=None):
-    """Return (hourly, files) from <output>/bronze, optionally only some years."""
-    bronze = f"{output}/bronze"
-    hourly = spark.read.parquet(f"{bronze}/inmet_hourly")
-    files = spark.read.parquet(f"{bronze}/inmet_files")
+def read_bronze(spark, years=None):
+    """Return (hourly, files) from the Bronze Spark tables, optionally only some years."""
+    hourly = spark.table("bronze.inmet_hourly")
+    files = spark.table("bronze.inmet_files")
     if years:
         # source_year is the partition column, so Spark only reads these folders
         hourly = hourly.where(F.col("source_year").isin(years))
@@ -97,22 +96,22 @@ HOUR_PATTERN = r"^([01]\d|2[0-3])(00 UTC|:00)$"              # 0000 UTC ... 2300
 
 def add_utc_time(hourly):
     """Add TEMPORARY utc_date and utc_hour columns (null when the text is bad)."""
-    date_text = F.regexp_replace("Data", "-", "/")
-    utc_date = F.when(F.col("Data").rlike(DATE_PATTERN), F.to_date(date_text, "yyyy/MM/dd"))
-    utc_hour = F.when(F.col("`Hora UTC`").rlike(HOUR_PATTERN),
-                      F.substring("`Hora UTC`", 1, 2).cast("int"))
+    date_text = F.regexp_replace("data", "-", "/")
+    utc_date = F.when(F.col("data").rlike(DATE_PATTERN), F.to_date(date_text, "yyyy/MM/dd"))
+    utc_hour = F.when(F.col("hora_utc").rlike(HOUR_PATTERN),
+                      F.substring("hora_utc", 1, 2).cast("int"))
     return hourly.withColumn("utc_date", utc_date).withColumn("utc_hour", utc_hour)
 
 
 def timestamp_formats(hourly):
     """
-    Which text formats appear in "Data" and "Hora UTC"? Every digit becomes 9,
+    Which text formats appear in "data" and "hora_utc"? Every digit becomes 9,
     so "2020/01/31" -> "9999/99/99" and "0100 UTC" -> "9999 UTC".
     """
     def formats(column):
         return hourly.select("source_year", F.lit(column).alias("column"),
                              F.regexp_replace(F.col(f"`{column}`"), r"\d", "9").alias("format"))
-    return (formats("Data").unionByName(formats("Hora UTC"))
+    return (formats("data").unionByName(formats("hora_utc"))
             .groupBy("source_year", "column", "format").count()
             .orderBy("column", "source_year", F.desc("count")))
 
@@ -249,13 +248,9 @@ def main():
     project = Path(__file__).resolve().parents[1]          # the inmet_weather folder
     output = os.environ.get("DAT535_OUTPUT_DIR") or str(project / "data" / "lake" / args.env)
 
-    spark = (SparkSession.builder.appName("inmet-profile-bronze")
-             .config("spark.driver.memory", "4g")
-             .config("spark.sql.session.timeZone", "UTC")
-             .getOrCreate())
-    spark.sparkContext.setLogLevel("WARN")
+    spark = start_spark("inmet-profile-bronze", output)
     try:
-        hourly, files = read_bronze(spark, output, args.years)
+        hourly, files = read_bronze(spark, args.years)
         run_profile(spark, hourly, files, f"{output}/silver/_profile")
         return 0
     except Exception as error:

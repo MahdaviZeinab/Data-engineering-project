@@ -1,267 +1,230 @@
 """
-Bronze layer: load the INMET weather CSV files into Parquet with Spark.
+Bronze layer: load the INMET weather CSV files into Spark tables.
 
-Bronze rule: "Load first. Interpret later."
-  1. Keep every value exactly as INMET wrote it (as text).
-  2. Add where each row came from, and when.
-  3. Check that the data arrived complete (expected vs received hours).
-  4. Put bad lines aside with a reason. Never drop them silently.
-  5. Running the job again gives the same result.
+Bronze keeps the data as it is. We only:
+  1. cut every line into its 19 values (all kept as text, nothing is changed),
+  2. add where each row came from (file, line number) and when we loaded it,
+  3. put lines we can not cut into 19 values in a quarantine table.
 
-Output (in <output>/bronze/):
-  inmet_hourly/      one row per station and hour, raw values
-  inmet_files/       one row per source file: station info + delivery check
-  inmet_quarantine/  lines we could not accept, with the reason
-  _runs/<run>.json   short summary of each run
+Tables (all in the Spark database "bronze", split by year):
+  bronze.inmet_hourly      one row per station and hour
+  bronze.inmet_files       one row per CSV file: station info and row counts
+  bronze.inmet_quarantine  lines with the wrong number of values
 
-Run:
-  python -m bronze.bronze_ingest                      # all years, dev
-  python -m bronze.bronze_ingest --years 2025         # only 2025
-  python -m bronze.bronze_ingest --env prod           # production folder
+Silver reads them by name, for example:  spark.table("bronze.inmet_hourly")
+
+Run (from the inmet_weather folder):
+  python -m bronze.bronze_ingest                  # all years, dev
+  python -m bronze.bronze_ingest --years 2025     # only 2025
+  python -m bronze.bronze_ingest --env prod       # production lake
 """
 
 import argparse
-import json
 import os
 import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
-from pyspark.sql.utils import AnalysisException
 
-# --------------------------------------------------------------------------
-# What INMET delivers (the "contract")
-# --------------------------------------------------------------------------
-ENCODING = "ISO-8859-1"          # Latin-1: keeps "PRECIPITAÇÃO" correct
-FIRST_DATA_LINE = 10             # lines 1-8 station info, line 9 header
-
-# INMET_<region>_<state>_<station>_<name>_<start dd-mm-yyyy>_A_<end dd-mm-yyyy>.CSV
-FILENAME = r"(?i)^INMET_([A-Z]+)_([A-Z]{2})_([A-Z0-9]+)_(.+)_(\d{2}-\d{2}-\d{4})_A_(\d{2}-\d{2}-\d{4})\.CSV$"
-
-STATION_INFO = ["region", "state", "station_name", "wmo_code",
-                "latitude", "longitude", "altitude", "foundation_date"]
-
-# The INMET header (line 9). Bronze keeps these ORIGINAL Portuguese names
-# as the column names (Spark 3.3+ allows spaces, commas and brackets in
-# Parquet column names). Short English names are a Silver decision.
-COLUMNS = [
-    "Data",
-    "Hora UTC",
-    "PRECIPITAÇÃO TOTAL, HORÁRIO (mm)",
-    "PRESSAO ATMOSFERICA AO NIVEL DA ESTACAO, HORARIA (mB)",
-    "PRESSÃO ATMOSFERICA MAX.NA HORA ANT. (AUT) (mB)",
-    "PRESSÃO ATMOSFERICA MIN. NA HORA ANT. (AUT) (mB)",
-    "RADIACAO GLOBAL (Kj/m²)",
-    "TEMPERATURA DO AR - BULBO SECO, HORARIA (°C)",
-    "TEMPERATURA DO PONTO DE ORVALHO (°C)",
-    "TEMPERATURA MÁXIMA NA HORA ANT. (AUT) (°C)",
-    "TEMPERATURA MÍNIMA NA HORA ANT. (AUT) (°C)",
-    "TEMPERATURA ORVALHO MAX. NA HORA ANT. (AUT) (°C)",
-    "TEMPERATURA ORVALHO MIN. NA HORA ANT. (AUT) (°C)",
-    "UMIDADE REL. MAX. NA HORA ANT. (AUT) (%)",
-    "UMIDADE REL. MIN. NA HORA ANT. (AUT) (%)",
-    "UMIDADE RELATIVA DO AR, HORARIA (%)",
-    "VENTO, DIREÇÃO HORARIA (gr) (° (gr))",
-    "VENTO, RAJADA MAXIMA (m/s)",
-    "VENTO, VELOCIDADE HORARIA (m/s)",
-]
-EXPECTED_HEADER = ";".join(COLUMNS)
+from common.spark import start_spark
 
 
-# --------------------------------------------------------------------------
-# Step 1: read each file once, as raw bytes
-# --------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# What an INMET file looks like
+# ---------------------------------------------------------------------------
+ENCODING = "ISO-8859-1"     # INMET files are Latin-1, not UTF-8
+FIRST_DATA_LINE = 10        # lines 1-8: station info, line 9: column names
+
+# Lines 1-8 of every file, for example line 3 is "ESTACAO:;BRASILIA"
+STATION_INFO = {
+    1: "region",
+    2: "state",
+    3: "station_name",
+    4: "wmo_code",
+    5: "latitude",
+    6: "longitude",
+    7: "altitude",
+    8: "foundation_date",
+}
+
+# The 19 columns of line 9: the name INMET writes -> the name in our table.
+# Spark tables do not allow commas or brackets in a column name, so we use a
+# simple version of the Portuguese name. The VALUES are not changed at all.
+# Silver gives the columns short English names.
+INMET_COLUMNS = {
+    "Data": "data",
+    "Hora UTC": "hora_utc",
+    "PRECIPITAÇÃO TOTAL, HORÁRIO (mm)": "precipitacao_total_mm",
+    "PRESSAO ATMOSFERICA AO NIVEL DA ESTACAO, HORARIA (mB)": "pressao_estacao_mb",
+    "PRESSÃO ATMOSFERICA MAX.NA HORA ANT. (AUT) (mB)": "pressao_max_mb",
+    "PRESSÃO ATMOSFERICA MIN. NA HORA ANT. (AUT) (mB)": "pressao_min_mb",
+    "RADIACAO GLOBAL (Kj/m²)": "radiacao_global_kj_m2",
+    "TEMPERATURA DO AR - BULBO SECO, HORARIA (°C)": "temperatura_ar_c",
+    "TEMPERATURA DO PONTO DE ORVALHO (°C)": "temperatura_orvalho_c",
+    "TEMPERATURA MÁXIMA NA HORA ANT. (AUT) (°C)": "temperatura_max_c",
+    "TEMPERATURA MÍNIMA NA HORA ANT. (AUT) (°C)": "temperatura_min_c",
+    "TEMPERATURA ORVALHO MAX. NA HORA ANT. (AUT) (°C)": "temperatura_orvalho_max_c",
+    "TEMPERATURA ORVALHO MIN. NA HORA ANT. (AUT) (°C)": "temperatura_orvalho_min_c",
+    "UMIDADE REL. MAX. NA HORA ANT. (AUT) (%)": "umidade_max_pct",
+    "UMIDADE REL. MIN. NA HORA ANT. (AUT) (%)": "umidade_min_pct",
+    "UMIDADE RELATIVA DO AR, HORARIA (%)": "umidade_relativa_pct",
+    "VENTO, DIREÇÃO HORARIA (gr) (° (gr))": "vento_direcao_graus",
+    "VENTO, RAJADA MAXIMA (m/s)": "vento_rajada_ms",
+    "VENTO, VELOCIDADE HORARIA (m/s)": "vento_velocidade_ms",
+}
+COLUMNS = list(INMET_COLUMNS.values())           # our 19 column names
+EXPECTED_HEADER = ";".join(INMET_COLUMNS)        # line 9 as INMET writes it
+
+DATABASE = "bronze"
+
+
+# ---------------------------------------------------------------------------
+# Step 1: read the files
+# ---------------------------------------------------------------------------
+def find_years(source):
+    # Look in the raw folder and return the year folders, e.g. [2020, 2021].
+    # We use this when the user does not say which years to load.
+    years = []
+    for name in os.listdir(source):
+        if name.isdigit() and len(name) == 4:
+            years.append(int(name))
+    return sorted(years)
+
+
 def read_files(spark, source, years):
-    """One row per file: name, checksum, station info, header and all lines."""
-    raw = (spark.read.format("binaryFile")
-           .option("pathGlobFilter", "*.[cC][sS][vV]")
-           .load([f"{source}/{y}" for y in years]))
+    # Read every CSV file of the chosen years. We get one row per file,
+    # with the file name, the year and the whole text of the file.
+    # We read the bytes ourselves so we can decode them as Latin-1;
+    # then words like "PRECIPITAÇÃO" stay correct.
+    folders = [f"{source}/{year}" for year in years]
+    files = (spark.read.format("binaryFile")
+             .option("pathGlobFilter", "*.[cC][sS][vV]")
+             .load(folders))
 
-    lines = F.split(F.decode("content", ENCODING), r"\r?\n")
-    path = F.expr("url_decode(replace(path, '+', '%2B'))")   # "%20" -> " "
-    df = raw.select(
-        F.element_at(F.split(path, "/"), -1).alias("source_file"),
-        # the year comes from the folder (data/raw/<year>/), not from the file
-        # name: a bad or unusual file name must not move rows to another year
-        F.element_at(F.split(path, "/"), -2).cast("int").alias("source_year"),
-        F.sha2("content", 256).alias("file_sha256"),
-        F.col("length").alias("file_bytes"),
-        lines.alias("lines"),
-    )
-
-    def name_part(i):
-        return F.regexp_extract("source_file", FILENAME, i)
-
-    start = F.to_date(name_part(5), "dd-MM-yyyy")
-    end = F.to_date(name_part(6), "dd-MM-yyyy")
-    df = (df.withColumn("station_code", F.upper(name_part(3)))
-            .withColumn("start_date", start)
-            .withColumn("end_date", end)
-            .withColumn("expected_rows", (F.datediff(end, start) + 1) * 24))
-
-    # Lines 1-8 look like "ESTACAO:;BRASILIA" -> keep the value after ';'
-    for i, name in enumerate(STATION_INFO, start=1):
-        value = F.regexp_extract(F.element_at("lines", i), r"^[^;]*;([^;]*)", 1)
-        df = df.withColumn(name, F.trim(value))
-
-    header = F.regexp_replace(F.element_at("lines", 9), r";\s*$", "")
-    return df.withColumn(
-        "file_problem",
-        F.when(~F.col("source_file").rlike(FILENAME), "bad_file_name")
-         .when(F.size("lines") < FIRST_DATA_LINE, "no_data_lines")
-         .when(header != EXPECTED_HEADER, "unexpected_header"),
+    # The path looks like ".../raw/2020/INMET_..._A_31-12-2020.CSV".
+    # Spark writes a space as "%20" in the path, url_decode turns it back.
+    path_parts = F.split(F.expr("url_decode(path)"), "/")
+    return files.select(
+        F.element_at(path_parts, -1).alias("source_file"),
+        F.element_at(path_parts, -2).cast("int").alias("source_year"),
+        F.decode("content", ENCODING).alias("text"),
     )
 
 
-# --------------------------------------------------------------------------
-# Step 2: split every hour line into its 19 values (kept as text)
-# --------------------------------------------------------------------------
-def split_lines(files):
-    df = (files.select("source_year", "station_code", "source_file", "file_problem",
-                       "start_date", "end_date",
-                       F.posexplode("lines").alias("pos", "raw_line"))
-               .withColumn("source_line_number", F.col("pos") + 1)
-               .where((F.col("source_line_number") >= FIRST_DATA_LINE) & (F.col("raw_line") != "")))
-
-    parts = F.split("raw_line", ";", -1)
-    # 19 values, plus the empty one after the last ';'
-    good_shape = (F.size(parts) == 19) | ((F.size(parts) == 20) & (F.element_at(parts, 20) == ""))
-    df = df.withColumn("problem", F.coalesce(
-        "file_problem", F.when(~good_shape, F.lit("wrong_number_of_values"))))
-
-    for i, name in enumerate(COLUMNS, start=1):
-        df = df.withColumn(name, F.element_at(parts, i))
-
-    # Is this hour inside the dates written in the file name? (only for the check;
-    # the "Data" value itself stays as text)
-    day = F.to_date(F.col("Data"), "yyyy/MM/dd")
-    return df.withColumn("in_date_range",
-                         F.coalesce(day.between(F.col("start_date"), F.col("end_date")), F.lit(False)))
+def add_station_code(files):
+    # Get the station code and the dates from the file name.
+    # Example: INMET_CO_DF_A001_BRASILIA_01-01-2025_A_31-12-2025.CSV
+    #   part 4 is the station code (A001),
+    #   the 3rd part from the end is the first day, the last part is the last day.
+    name_parts = F.split(F.regexp_replace("source_file", "(?i)\\.csv$", ""), "_")
+    return (files
+            .withColumn("station_code", F.element_at(name_parts, 4))
+            .withColumn("start_date", F.to_date(F.element_at(name_parts, -3), "dd-MM-yyyy"))
+            .withColumn("end_date", F.to_date(F.element_at(name_parts, -1), "dd-MM-yyyy")))
 
 
-# --------------------------------------------------------------------------
-# Step 3: delivery check per file (expected vs received)
-# --------------------------------------------------------------------------
-def check_files(files, lines):
-    good = lines.where(F.col("problem").isNull())
-    hour = F.concat_ws(" ", F.col("Data"), F.col("Hora UTC"))
-    # a real hour is "0000 UTC" ... "2300 UTC"; anything else (e.g. "2500 UTC")
-    # is kept as raw text, but it must not count as a received hour
-    valid_hour = F.col("Hora UTC").rlike(r"^([01][0-9]|2[0-3])00 UTC$")
-    counts = good.groupBy("source_file").agg(
+def split_into_lines(files):
+    # Turn "one row per file" into "one row per line of the file".
+    # We also keep the line number, so every row can be found again in the file.
+    lines = F.split("text", "\r?\n")
+    return (files
+            .select("source_year", "source_file", "station_code",
+                    F.posexplode(lines).alias("index", "line"))
+            .withColumn("source_line_number", F.col("index") + 1)
+            .drop("index"))
+
+
+def only_data_lines(lines):
+    # Keep only the data lines: skip the 8 station lines, the header line
+    # and empty lines (the file ends with an empty line).
+    return lines.where((F.col("source_line_number") >= FIRST_DATA_LINE) & (F.col("line") != ""))
+
+
+# ---------------------------------------------------------------------------
+# Step 2: make the three tables
+# ---------------------------------------------------------------------------
+def has_19_values(line):
+    # True for a good data line. INMET ends every line with ";",
+    # so a good line gives 19 values, or 20 when we count the empty one at the end.
+    number_of_values = F.size(F.split(line, ";"))
+    return number_of_values.isin(19, 20)
+
+
+def make_hourly(lines):
+    # Make the hourly table: one row per station and hour.
+    # Each line is cut at ";" into the 19 values. The values stay text,
+    # exactly as INMET wrote them (for example "25,5" or "-9999").
+    good_lines = lines.where(has_19_values("line"))
+    values = F.split("line", ";")
+    columns = []
+    for number, name in enumerate(COLUMNS, start=1):
+        columns.append(F.element_at(values, number).alias(name))
+    return good_lines.select("source_year", "station_code", "source_file",
+                             "source_line_number", *columns)
+
+
+def make_quarantine(lines):
+    # Make the quarantine table: the data lines we could NOT cut into 19 values.
+    # We keep the whole line and the reason, so we never lose data silently.
+    bad_lines = lines.where(~has_19_values("line"))
+    return bad_lines.select("source_year", "station_code", "source_file",
+                            "source_line_number",
+                            F.col("line").alias("raw_line"),
+                            F.lit("wrong number of values").alias("problem"))
+
+
+def make_files_table(files, hourly, quarantine):
+    # Make the files table: one row per CSV file, with the station info
+    # from lines 1-8 and a simple check that the file is complete.
+    lines = F.split("text", "\r?\n")
+    table = files.select("source_year", "source_file", "station_code",
+                         "start_date", "end_date", "text")
+
+    # Lines 1-8 look like "ESTACAO:;BRASILIA". We keep the part after ";".
+    for line_number, name in STATION_INFO.items():
+        line = F.element_at(lines, line_number)
+        table = table.withColumn(name, F.trim(F.split(line, ";").getItem(1)))
+
+    # Line 9 should be the 19 column names INMET promised.
+    header = F.regexp_replace(F.element_at(lines, 9), ";$", "")
+    table = table.withColumn("header_ok", header == EXPECTED_HEADER).drop("text")
+
+    # How many hours should be in the file (24 per day), and how many we got.
+    days = F.datediff("end_date", "start_date") + 1
+    table = table.withColumn("expected_hours", days * 24)
+    table = table.join(count_hours(hourly), "source_file", "left")
+    table = table.join(count_bad_lines(quarantine), "source_file", "left")
+    table = table.fillna(0, ["received_rows", "received_hours", "quarantined_lines"])
+    return table.withColumn("missing_hours", F.col("expected_hours") - F.col("received_hours"))
+
+
+def count_hours(hourly):
+    # For each file: how many rows we got, and how many DIFFERENT hours.
+    # If the same hour is in the file twice, rows is bigger than hours.
+    return hourly.groupBy("source_file").agg(
         F.count("*").alias("received_rows"),
-        F.countDistinct(hour).alias("distinct_hours"),
-        # only VALID hours inside the file name's dates count towards "complete"
-        F.countDistinct(F.when(F.col("in_date_range") & valid_hour, hour)).alias("hours_in_range"),
-        F.sum(F.when(valid_hour, 0).otherwise(1)).alias("invalid_hours"),
-        # rows outside those dates are reported on their own
-        F.sum(F.when(F.col("in_date_range"), 0).otherwise(1)).alias("extra_hours"),
-    )
-    bad = lines.where(F.col("problem").isNotNull()).groupBy("source_file") \
-               .agg(F.count("*").alias("quarantined_lines"))
-
-    df = (files.drop("lines")
-               .join(counts, "source_file", "left")
-               .join(bad, "source_file", "left")
-               .fillna(0, ["received_rows", "distinct_hours", "hours_in_range",
-                           "extra_hours", "invalid_hours", "quarantined_lines"])
-               .withColumn("duplicate_rows", F.col("received_rows") - F.col("distinct_hours"))
-               .withColumn("missing_hours", F.col("expected_rows") - F.col("hours_in_range")))
-    return df.withColumn(
-        "status",
-        F.when(F.col("file_problem").isNotNull(), "QUARANTINED")
-         # != 0, not > 0: a negative number is impossible and also a problem
-         .when(F.col("missing_hours") != 0, "INCOMPLETE")
-         # all hours are there, but something else was wrong in the file
-         .when((F.col("duplicate_rows") > 0) | (F.col("quarantined_lines") > 0)
-               | (F.col("invalid_hours") > 0) | (F.col("extra_hours") > 0),
-               "COMPLETE_WITH_ISSUES")
-         .otherwise("COMPLETE"),
-    ).drop("distinct_hours", "hours_in_range")
+        F.countDistinct("data", "hora_utc").alias("received_hours"))
 
 
-# --------------------------------------------------------------------------
-# Step 4: write safely, replacing only the years of this run
-# --------------------------------------------------------------------------
-def _fs(spark, path):
-    hadoop = spark._jvm.org.apache.hadoop.fs
-    return hadoop, hadoop.Path(path).getFileSystem(spark._jsc.hadoopConfiguration())
+def count_bad_lines(quarantine):
+    # For each file: how many lines went to the quarantine table.
+    return quarantine.groupBy("source_file").agg(F.count("*").alias("quarantined_lines"))
 
 
-def write_temp(spark, df, path, years, expected_rows, run_id):
-    """
-    Phase 1: write the new data to <path>/_new_<run_id> and check it.
-    The real table is not touched. Raises if the check fails.
-    Folders starting with "_" are ignored by Spark, so readers never see it.
-    """
-    hadoop, fs = _fs(spark, path)
-    temp = f"{path}/_new_{run_id}"
-    df.repartition("source_year").write.mode("overwrite").partitionBy("source_year").parquet(temp)
-
-    try:
-        # 1. the row count must match the run report
-        try:
-            written = spark.read.parquet(temp).count()
-        except AnalysisException:      # no rows at all (e.g. nothing quarantined)
-            written = 0
-        if written != expected_rows:
-            raise RuntimeError(f"{path}: wrote {written} rows, expected {expected_rows}. "
-                               "Nothing was replaced.")
-
-        # 2. only the years of this run may be there; any other folder would be
-        #    deleted with the temp folder later, so stop instead of losing rows
-        allowed = {f"source_year={y}" for y in years}
-        found = {s.getPath().getName() for s in fs.listStatus(hadoop.Path(temp))
-                 if s.isDirectory()}
-        extra = sorted(found - allowed)
-        if extra:
-            raise RuntimeError(f"{path}: rows outside the years {years}: {extra}. "
-                               "Nothing was replaced.")
-    except Exception:
-        fs.delete(hadoop.Path(temp), True)
-        raise
+def add_load_info(table, run_id, load_time):
+    # Add 4 columns that tell where and when this row was loaded.
+    # This helps us later to find out which run made a row.
+    return (table
+            .withColumn("_bronze_source", F.lit("inmet_portal"))
+            .withColumn("_bronze_run_id", F.lit(run_id))
+            .withColumn("_bronze_ingestion_time", F.lit(load_time).cast("timestamp"))
+            .withColumn("_bronze_code_version", F.lit(git_version())))
 
 
-def swap_years(spark, path, years, run_id):
-    """
-    Phase 2: for each year, move the old folder away and the new one in.
-    fs.rename() returns False on failure instead of raising, so every result
-    is checked. On failure the old data is kept in <path>/_old_<run_id>.
-    """
-    hadoop, fs = _fs(spark, path)
-    temp, old = f"{path}/_new_{run_id}", f"{path}/_old_{run_id}"
-
-    def move(src, dst):
-        if not fs.rename(hadoop.Path(src), hadoop.Path(dst)):
-            raise RuntimeError(f"Could not move {src} to {dst}. The old data is "
-                               f"still in {old}; move it back by hand.")
-
-    fs.mkdirs(hadoop.Path(old))
-    for y in years:
-        current, fresh = f"{path}/source_year={y}", f"{temp}/source_year={y}"
-        if fs.exists(hadoop.Path(current)):
-            move(current, f"{old}/source_year={y}")
-        if fs.exists(hadoop.Path(fresh)):
-            move(fresh, current)
-    # only now, when every move worked, is the old data deleted
-    fs.delete(hadoop.Path(old), True)
-    fs.delete(hadoop.Path(temp), True)
-
-
-def replace_years(spark, df, path, years, expected_rows, run_id):
-    """Write + check + swap one table (both phases)."""
-    write_temp(spark, df, path, years, expected_rows, run_id)
-    swap_years(spark, path, years, run_id)
-
-def drop_temp(spark, path, run_id):
-    hadoop, fs = _fs(spark, path)
-    fs.delete(hadoop.Path(f"{path}/_new_{run_id}"), True)
-
-
-def git_commit():
+def git_version():
+    # The short Git commit of our code, so we know which code made the data.
     try:
         return subprocess.check_output(["git", "rev-parse", "--short", "HEAD"],
                                        stderr=subprocess.DEVNULL, text=True).strip()
@@ -269,93 +232,86 @@ def git_commit():
         return "unknown"
 
 
-def run_bronze(spark, source, output, years=None, run_id=None):
+# ---------------------------------------------------------------------------
+# Step 3: save the tables in Spark
+# ---------------------------------------------------------------------------
+def save_table(spark, table, name, years):
+    # Save a table in Spark, split into one part per year (source_year).
+    # If the table is already there, we first delete the years we load again,
+    # then add the new rows. The other years are not touched.
+    # So running the job twice gives the same result (no double rows).
+    full_name = f"{DATABASE}.{name}"
+    if spark.catalog.tableExists(full_name):
+        for year in years:
+            spark.sql(f"ALTER TABLE {full_name} DROP IF EXISTS PARTITION (source_year={year})")
+    (table.write
+          .mode("append")
+          .format("parquet")
+          .partitionBy("source_year")
+          .saveAsTable(full_name))
+
+
+# ---------------------------------------------------------------------------
+# The whole Bronze job
+# ---------------------------------------------------------------------------
+def run_bronze(spark, source, years=None, run_id=None):
+    # Do all the steps: read the files, make the three tables, save them.
     if not years:
-        years = sorted(int(d) for d in os.listdir(source) if d.isdigit() and len(d) == 4)
+        years = find_years(source)
     now = datetime.now(timezone.utc)
+    load_time = now.strftime("%Y-%m-%d %H:%M:%S")
     run_id = run_id or now.strftime("%Y%m%dT%H%M%SZ")
-    bronze = f"{output}/bronze"
+    print(f"BRONZE: loading years {years} (run {run_id})")
 
-    # Read the CSV files only once; the next steps reuse this.
-    files = read_files(spark, source, years).persist()
-    lines = split_lines(files)
-    manifest = check_files(files, lines)
+    # read every file only once, the next steps all use it
+    files = add_station_code(read_files(spark, source, years)).cache()
+    lines = only_data_lines(split_into_lines(files))
 
-    evidence = [
-        F.lit("inmet_portal").alias("_bronze_source"),
-        F.lit(run_id).alias("_bronze_run_id"),
-        F.to_timestamp(F.lit(now.strftime("%Y-%m-%d %H:%M:%S"))).alias("_bronze_ingestion_time"),
-        F.lit(git_commit()).alias("_bronze_code_version"),
-    ]
-    hourly = lines.where(F.col("problem").isNull()).select(
-        "source_year", "station_code", "source_file", "source_line_number", *[F.col(f"`{c}`") for c in COLUMNS], *evidence)
-    quarantine = lines.where(F.col("problem").isNotNull()).select(
-        "source_year", "station_code", "source_file", "source_line_number",
-        "raw_line", "problem", *evidence)
+    hourly = make_hourly(lines)
+    quarantine = make_quarantine(lines)
+    files_table = make_files_table(files, hourly, quarantine)
 
-    # Delivery receipt for the whole run (also tells us how many rows to expect).
-    row = manifest.agg(
-        F.count("*").alias("files"),
-        F.sum(F.when(F.col("status") == "COMPLETE", 1).otherwise(0)).alias("complete"),
-         F.sum(F.when(F.col("status") == "COMPLETE_WITH_ISSUES", 1).otherwise(0)).alias("complete_with_issues"),
-        F.sum(F.when(F.col("status") == "INCOMPLETE", 1).otherwise(0)).alias("incomplete"),
-        F.sum(F.when(F.col("status") == "QUARANTINED", 1).otherwise(0)).alias("quarantined"),
-        F.sum("expected_rows").alias("expected_rows"),
-        F.sum("received_rows").alias("received_rows"),
-        F.sum("missing_hours").alias("missing_hours"),
-        F.sum("extra_hours").alias("extra_hours"),
-        F.sum("invalid_hours").alias("invalid_hours"),
-        F.sum("duplicate_rows").alias("duplicate_rows"),
-        F.sum("quarantined_lines").alias("quarantined_lines"),
-    ).first()
-    report = {"run_id": run_id, "years": years, "time_utc": now.isoformat(timespec="seconds"),
-              **{k: int(v or 0) for k, v in row.asDict().items()}}
+    spark.sql(f"CREATE DATABASE IF NOT EXISTS {DATABASE}")
+    save_table(spark, add_load_info(hourly, run_id, load_time), "inmet_hourly", years)
+    save_table(spark, add_load_info(quarantine, run_id, load_time), "inmet_quarantine", years)
+    save_table(spark, add_load_info(files_table, run_id, load_time), "inmet_files", years)
+    files.unpersist()
 
-    tables = [
-        (hourly, f"{bronze}/inmet_hourly", report["received_rows"]),
-        (quarantine, f"{bronze}/inmet_quarantine", report["quarantined_lines"]),
-        (manifest.select("*", *evidence), f"{bronze}/inmet_files", report["files"]),
-    ]
-    # Phase 1: write and check ALL tables first. If one fails, none is replaced,
-    # so the three tables always come from the same run.
-    try:
-        for df, path, expected in tables:
-            write_temp(spark, df, path, years, expected, run_id)
-    except Exception:
-        for _, path, _ in tables:
-            drop_temp(spark, path, run_id)
-        raise
-    finally:
-        files.unpersist()
-    # Phase 2: all checks passed, now swap the year folders of every table.
-    for _, path, _ in tables:
-        swap_years(spark, path, years, run_id)
+    print_summary(spark, years)
 
-    os.makedirs(f"{bronze}/_runs", exist_ok=True)
-    with open(f"{bronze}/_runs/{run_id}.json", "w") as f:
-        json.dump(report, f, indent=2)
-    print("BRONZE RUN:", json.dumps(report))
-    return report
+
+def print_summary(spark, years):
+    # Print a short report in the log: how many rows each table has now,
+    # and which files have missing or double hours, bad lines or a strange header.
+    for name in ["inmet_hourly", "inmet_files", "inmet_quarantine"]:
+        rows = spark.table(f"{DATABASE}.{name}").where(F.col("source_year").isin(years)).count()
+        print(f"BRONZE: {DATABASE}.{name} has {rows} rows for {years}")
+
+    files = spark.table(f"{DATABASE}.inmet_files").where(F.col("source_year").isin(years))
+    problems = files.where((F.col("missing_hours") != 0) | ~F.col("header_ok")
+                           | (F.col("received_rows") != F.col("received_hours"))
+                           | (F.col("quarantined_lines") > 0))
+    print(f"BRONZE: {problems.count()} files need a look:")
+    problems.select("source_year", "source_file", "header_ok", "expected_hours",
+                    "received_hours", "missing_hours", "received_rows", "quarantined_lines") \
+            .show(20, truncate=False)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Load INMET CSV files into the Bronze layer.")
+    # Read the command line options, start Spark and run the job.
+    parser = argparse.ArgumentParser(description="Load INMET CSV files into the Bronze tables.")
     project = Path(__file__).resolve().parents[1]          # the inmet_weather folder
     parser.add_argument("--source", default=str(project / "data" / "raw"))
     parser.add_argument("--env", default="dev", choices=["dev", "prod"])
     parser.add_argument("--years", type=int, nargs="*")
     args = parser.parse_args()
 
-    # Same rule as the course lab: CI can choose the folder with DAT535_OUTPUT_DIR.
-    output = os.environ.get("DAT535_OUTPUT_DIR") or str(project / "data" / "lake" / args.env)
+    # The lake folder keeps the Spark tables. CI can choose it with DAT535_OUTPUT_DIR.
+    lake = os.environ.get("DAT535_OUTPUT_DIR") or str(project / "data" / "lake" / args.env)
 
-    spark = (SparkSession.builder.appName("inmet-bronze")
-             .config("spark.driver.memory", "4g")
-             .config("spark.sql.session.timeZone", "UTC")
-             .getOrCreate())
-    spark.sparkContext.setLogLevel("WARN")
+    spark = start_spark("inmet-bronze", lake)
     try:
-        run_bronze(spark, os.path.abspath(args.source), output, args.years)
+        run_bronze(spark, os.path.abspath(args.source), args.years)
         return 0
     except Exception as error:
         print("BRONZE FAILED:", error)

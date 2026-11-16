@@ -10,7 +10,8 @@
 # The data is kept OUTSIDE the GitHub work folder, in DATA_ROOT on the VM, so it
 # survives between runs (GitHub cleans the work folder at every checkout):
 #   $DATA_ROOT/raw/<year>/*.CSV       raw INMET files
-#   $DATA_ROOT/lake/<env>/bronze/     Bronze output (Parquet)
+#   $DATA_ROOT/lake/<env>/warehouse/  Spark tables (bronze.inmet_hourly, ...)
+#   $DATA_ROOT/lake/<env>/metastore_db/  Spark's list of tables
 #   $DATA_ROOT/venv/                  Python packages (re-used between runs)
 name: bronze-ingest
 
@@ -86,14 +87,3 @@ jobs:
         env:
           DAT535_OUTPUT_DIR: ${{ env.DATA_ROOT }}/lake/${{ env.LAKE_ENV }}
         run: python -m bronze.bronze_ingest --source "$DATA_ROOT/raw" --env "$LAKE_ENV" --years $YEARS
-
-      - name: Keep the run summary and file checks as evidence
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: bronze-run-${{ github.run_id }}
-          path: |
-            ${{ env.DATA_ROOT }}/lake/${{ env.LAKE_ENV }}/bronze/_runs/
-            ${{ env.DATA_ROOT }}/lake/${{ env.LAKE_ENV }}/bronze/inmet_files/
-          if-no-files-found: warn
-          retention-days: 30

@@ -7,45 +7,48 @@ from silver.contract import BRONZE_COLUMNS, MEASUREMENTS
 from silver.silver_build import (cast_values, count_duplicates, count_not_numeric, make_time,
                                  remove_duplicates, run_silver)
 
-TEMP = "TEMPERATURA DO AR - BULBO SECO, HORARIA (°C)"   # becomes temp_c
+TEMP = "temperatura_ar_c"   # becomes temp_c
 
 
 @pytest.fixture(scope="module")
-def spark():
+def spark(tmp_path_factory):
     s = (SparkSession.builder.master("local[2]")
          .config("spark.sql.shuffle.partitions", "2")
          .config("spark.sql.session.timeZone", "UTC")
+         .config("spark.sql.warehouse.dir", str(tmp_path_factory.mktemp("warehouse")))
          .config("spark.ui.enabled", "false").getOrCreate())
     s.sparkContext.setLogLevel("ERROR")
     yield s
     s.stop()
 
 
-def fake_bronze(spark, output, columns):
-    """Write 2 hourly rows (2020 and 2021) and 1 file row, all as text."""
+def fake_bronze(spark, columns):
+    """Save 2 hourly rows (2020 and 2021) and 1 file row as Bronze Spark tables, all as text."""
+    spark.sql("DROP DATABASE IF EXISTS bronze CASCADE")
+    spark.sql("CREATE DATABASE bronze")
     rows = [{c: "1" for c in columns} | {"source_year": y} for y in (2020, 2021)]
     hourly = spark.createDataFrame(rows)
-    hourly.write.partitionBy("source_year").parquet(f"{output}/bronze/inmet_hourly")
+    hourly.write.partitionBy("source_year").saveAsTable("bronze.inmet_hourly")
     spark.createDataFrame([{"station_code": "1", "state": "SP", "source_year": 2020}]) \
-         .write.partitionBy("source_year").parquet(f"{output}/bronze/inmet_files")
+         .write.partitionBy("source_year").saveAsTable("bronze.inmet_files")
 
 
-def test_runs_and_adds_run_id(spark, tmp_path):
-    fake_bronze(spark, tmp_path, BRONZE_COLUMNS)
-    df = run_silver(spark, str(tmp_path), run_id="test")
+def test_runs_and_adds_run_id(spark):
+    fake_bronze(spark, BRONZE_COLUMNS)
+    df = run_silver(spark, run_id="test")
     assert df.count() == 2
     assert df.first()["_silver_run_id"] == "test"
 
 
-def test_years_option(spark, tmp_path):
-    fake_bronze(spark, tmp_path, BRONZE_COLUMNS)
-    assert run_silver(spark, str(tmp_path), years=[2021]).count() == 1
+def test_years_option(spark):
+    fake_bronze(spark, BRONZE_COLUMNS)
+    assert run_silver(spark, years=[2021]).count() == 1
 
 
-def test_stops_on_wrong_schema(spark, tmp_path):
-    fake_bronze(spark, tmp_path, [c for c in BRONZE_COLUMNS if c != "Data"])
+def test_stops_on_wrong_schema(spark):
+    fake_bronze(spark, [c for c in BRONZE_COLUMNS if c != "data"])
     with pytest.raises(ValueError, match="Missing"):
-        run_silver(spark, str(tmp_path))
+        run_silver(spark)
 
 
 def temp_rows(spark, values):
@@ -78,7 +81,7 @@ def test_count_not_numeric(spark):
 # ---------------------------------------------------------------- Silver 5: time
 def hours(spark, rows):
     """Make fake hour rows: station, date, hour."""
-    return spark.createDataFrame(rows, "station_code string, Data string, `Hora UTC` string")
+    return spark.createDataFrame(rows, "station_code string, data string, hora_utc string")
 
 
 def stations(spark):

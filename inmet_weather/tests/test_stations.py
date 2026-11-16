@@ -1,4 +1,4 @@
-"""Tests for Silver 7: station information, with a tiny fake bronze/inmet_files."""
+"""Tests for Silver 7: station information, with a tiny fake bronze.inmet_files table."""
 import datetime as dt
 
 import pytest
@@ -18,10 +18,11 @@ BSB = dict(region="CO", state="DF", name="BRASILIA", lat="-15,78944444",
 
 
 @pytest.fixture(scope="module")
-def spark():
+def spark(tmp_path_factory):
     s = (SparkSession.builder.master("local[2]")
          .config("spark.sql.shuffle.partitions", "2")
          .config("spark.sql.session.timeZone", "UTC")
+         .config("spark.sql.warehouse.dir", str(tmp_path_factory.mktemp("warehouse")))
          .config("spark.ui.enabled", "false").getOrCreate())
     s.sparkContext.setLogLevel("ERROR")
     yield s
@@ -139,8 +140,9 @@ def test_latest_station(spark):
 
 # ---------------------------------------------------------------- whole step
 def test_build_stations_publishes_both_tables(spark, tmp_path):
+    spark.sql("CREATE DATABASE IF NOT EXISTS bronze")
     files(spark, [("A001", 2020, {}), ("A001", 2021, {}), ("A002", 2021, {})]) \
-        .write.partitionBy("source_year").parquet(f"{tmp_path}/bronze/inmet_files")
+        .write.mode("overwrite").partitionBy("source_year").saveAsTable("bronze.inmet_files")
     build_stations(spark, str(tmp_path), "test")
     history = spark.read.parquet(f"{tmp_path}/silver/station_history")
     station = spark.read.parquet(f"{tmp_path}/silver/station")

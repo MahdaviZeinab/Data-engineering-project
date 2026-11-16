@@ -4,10 +4,14 @@ Hourly weather data from INMET (Brazil), 2020–2025: about 3,470 station files,
 Batch processing with Apache Spark and GitHub Actions.
 
 ```
-INMET website ─► bronze/injection.py ─► data/raw/<year>/*.CSV ─► bronze/bronze_ingest.py ─► data/lake/<env>/bronze/
-                                                                   silver/ ─► data/lake/<env>/silver/
-                                                                   gold/   ─► data/lake/<env>/gold/
+INMET website ─► bronze/injection.py ─► data/raw/<year>/*.CSV ─► bronze/bronze_ingest.py ─► Spark tables bronze.*
+                                                     silver/ reads spark.table("bronze.inmet_hourly") ─► silver
+                                                     gold/   (later)
 ```
+
+Each layer saves its result as **Spark tables** (`saveAsTable`, Parquet, split by year).
+The next layer reads them by name with `spark.table(...)`, not from a folder path.
+Every layer starts Spark with `common/spark.py`, so they all see the same tables.
 
 ## Folders
 
@@ -15,14 +19,15 @@ INMET website ─► bronze/injection.py ─► data/raw/<year>/*.CSV ─► bro
 inmet_weather/
 ├── bronze/                 Bronze layer: getting the data in
 │   ├── injection.py        download + unzip the yearly INMET files
-│   ├── bronze_ingest.py    Spark job: raw files -> Bronze tables
-│   └── BRONZE_REPORT.md    what the Bronze code does, how and why
+│   └── bronze_ingest.py    Spark job: raw files -> Bronze Spark tables
+├── common/
+│   └── spark.py            starts Spark so every layer sees the same tables
 ├── silver/                 Silver layer (next step)
 ├── gold/                   Gold layer (later)
 ├── tests/                  tests for all layers
 ├── data/                   NOT in Git (see .gitignore)
 │   ├── raw/<year>/         the original INMET CSV files
-│   └── lake/<env>/         the output: bronze/, silver/, gold/
+│   └── lake/<env>/         the output: warehouse/ (Spark tables) + metastore_db/ (table list)
 ├── requirements.txt
 └── pytest.ini
 ```
@@ -53,15 +58,27 @@ If `DAT535_OUTPUT_DIR` is set (as in the course lab CI), the output goes there.
 
 ## Bronze output
 
-| Table | One row per | Content |
+| Spark table | One row per | Content |
 |---|---|---|
-| `inmet_hourly/` | station-hour | the 19 values as text with the original Portuguese column names, source file, line number, `_bronze_*` columns |
-| `inmet_files/` | source file | station info, checksum, expected / received / missing / extra / duplicate hours, status |
-| `inmet_quarantine/` | rejected line | the raw line and the problem |
-| `_runs/<run>.json` | run | summary of the run |
+| `bronze.inmet_hourly` | station-hour | the 19 values as text (as INMET wrote them), source file, line number, `_bronze_*` columns |
+| `bronze.inmet_files` | source file | station info (lines 1-8), header check, expected / received / missing hours |
+| `bronze.inmet_quarantine` | bad line | the raw line and the problem |
 
-All tables are Parquet, split into one folder per year (`source_year=2020`, …).
+All tables are Parquet, split by `source_year`. Loading one year again only replaces that year.
+Column names are simple versions of the Portuguese names (Spark tables do not allow commas
+in column names); the values are not changed.
 
+Look at the tables:
+
+```python
+from common.spark import start_spark
+spark = start_spark("look", "data/lake/dev")
+spark.sql("SHOW TABLES IN bronze").show()
+spark.table("bronze.inmet_files").show()
+```
+
+Note: the table list is kept in a small Derby database (`metastore_db/`), which allows only
+one Spark program at a time. Run Bronze, then Silver, not both at once.
 ## GitHub Actions
 
 The workflow is in `.github/workflows/` at the repository root:

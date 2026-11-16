@@ -6,26 +6,26 @@ Plain Python only (no Spark), so it is easy to read and to test.
 """
 
 # --------------------------------------------------------------------------
-# Names: Bronze (Portuguese, as INMET writes it) -> Silver (short English)
-# "Data" + "Hora UTC" are not renamed: together they become observed_at_utc (S5).
+# Names: Bronze (simple Portuguese names, see bronze/bronze_ingest.py) -> Silver (short English)
+# "data" + "hora_utc" are not renamed: together they become observed_at_utc (S5).
 RENAME = {
-    "PRECIPITAÇÃO TOTAL, HORÁRIO (mm)": "precip_mm",
-    "PRESSAO ATMOSFERICA AO NIVEL DA ESTACAO, HORARIA (mB)": "pressure_mb",
-    "PRESSÃO ATMOSFERICA MAX.NA HORA ANT. (AUT) (mB)": "pressure_max_mb",
-    "PRESSÃO ATMOSFERICA MIN. NA HORA ANT. (AUT) (mB)": "pressure_min_mb",
-    "RADIACAO GLOBAL (Kj/m²)": "radiation_kj_m2",
-    "TEMPERATURA DO AR - BULBO SECO, HORARIA (°C)": "temp_c",
-    "TEMPERATURA DO PONTO DE ORVALHO (°C)": "dew_point_c",
-    "TEMPERATURA MÁXIMA NA HORA ANT. (AUT) (°C)": "temp_max_c",
-    "TEMPERATURA MÍNIMA NA HORA ANT. (AUT) (°C)": "temp_min_c",
-    "TEMPERATURA ORVALHO MAX. NA HORA ANT. (AUT) (°C)": "dew_point_max_c",
-    "TEMPERATURA ORVALHO MIN. NA HORA ANT. (AUT) (°C)": "dew_point_min_c",
-    "UMIDADE REL. MAX. NA HORA ANT. (AUT) (%)": "humidity_max_pct",
-    "UMIDADE REL. MIN. NA HORA ANT. (AUT) (%)": "humidity_min_pct",
-    "UMIDADE RELATIVA DO AR, HORARIA (%)": "humidity_pct",
-    "VENTO, DIREÇÃO HORARIA (gr) (° (gr))": "wind_dir_deg",
-    "VENTO, RAJADA MAXIMA (m/s)": "wind_gust_ms",
-    "VENTO, VELOCIDADE HORARIA (m/s)": "wind_speed_ms",
+    "precipitacao_total_mm": "precip_mm",
+    "pressao_estacao_mb": "pressure_mb",
+    "pressao_max_mb": "pressure_max_mb",
+    "pressao_min_mb": "pressure_min_mb",
+    "radiacao_global_kj_m2": "radiation_kj_m2",
+    "temperatura_ar_c": "temp_c",
+    "temperatura_orvalho_c": "dew_point_c",
+    "temperatura_max_c": "temp_max_c",
+    "temperatura_min_c": "temp_min_c",
+    "temperatura_orvalho_max_c": "dew_point_max_c",
+    "temperatura_orvalho_min_c": "dew_point_min_c",
+    "umidade_max_pct": "humidity_max_pct",
+    "umidade_min_pct": "humidity_min_pct",
+    "umidade_relativa_pct": "humidity_pct",
+    "vento_direcao_graus": "wind_dir_deg",
+    "vento_rajada_ms": "wind_gust_ms",
+    "vento_velocidade_ms": "wind_speed_ms",
 }
 MEASUREMENTS = list(RENAME.values())          # the 17 double columns
 
@@ -35,12 +35,12 @@ MISSING_CODES = ["", "-9999"]                 # INMET's "no value" (becomes null
 # Lineage: kept so every Silver row points back to its Bronze line.
 LINEAGE = ["source_file", "source_line_number", "_bronze_run_id"]
 
-# The exact columns Silver expects in bronze/inmet_hourly.
+# The exact columns Silver expects in the table bronze.inmet_hourly.
 # Written out here on purpose (not imported from Bronze): if Bronze changes,
 # this check notices it.
 BRONZE_COLUMNS = [
     "source_year", "station_code", "source_file", "source_line_number",
-    "Data", "Hora UTC", *RENAME,
+    "data", "hora_utc", *RENAME,
     "_bronze_source", "_bronze_run_id", "_bronze_ingestion_time", "_bronze_code_version",
 ]
 
