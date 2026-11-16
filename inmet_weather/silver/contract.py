@@ -107,6 +107,17 @@ STATE_TIMEZONE = {
 # (UTC-2, "America/Noronha"). Fill in from the S1 station list.
 STATION_TIMEZONE_OVERRIDE = {}
 
+# --------------------------------------------------------------------------
+# Stations (S7): bronze/inmet_files has the 8 info lines of every file
+# (one file = one station, one year).
+# A move smaller than this is only rounding, not a real change.
+LOCATION_TOLERANCE_DEG = 0.001                # about 100 m
+ALTITUDE_TOLERANCE_M = 1.0
+# Simple box around Brazil, incl. the islands (Fernando de Noronha, Trindade).
+# A box is not the real border: it finds clearly wrong coordinates
+# (e.g. a missing minus sign), not stations a few km over the border.
+BRAZIL_BOX = {"lat": (-34.0, 5.5), "lon": (-74.5, -28.5)}
+
 
 def check_schema(columns):
     """Stop the Silver job if Bronze has a missing or a new column."""

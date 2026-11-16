@@ -19,6 +19,7 @@ from pyspark.sql.window import Window
 
 from common.publish import has_columns, not_empty, publish
 from silver import contract
+from silver.stations import build_stations
 
 
 # Read Bronze
@@ -187,6 +188,9 @@ def main():
                       "temp_c", "humidity_pct", "precip_mm", "dq_issue", "source_year") \
               .show(10, truncate=False)
         result.groupBy("dq_issue").count().show()
+
+        # Silver 7: station tables (small, always built from all years)
+        build_stations(spark, output, run_id)
         return 0
     except Exception as error:
         print("SILVER FAILED:", error)
