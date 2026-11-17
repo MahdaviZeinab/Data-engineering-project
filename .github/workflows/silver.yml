@@ -1,17 +1,12 @@
-# Silver run on the OpenStack VM (self-hosted runner).
-# 1. run the tests   2. if they pass, build Silver for the last 3 years (2023-2025).
+# Silver run on the OpenStack VM (self-hosted runner), ONLY by hand.
+# 1. run the tests   2. if they pass, build Silver for 2024 and 2025.
 #
 # When does it run?
-#   - automatically after every push (any branch)
-#   - automatically after bronze-ingest finished successfully
 #   - by hand: Actions tab -> silver -> Run workflow
+#   (After a push, Silver already runs as the second job of bronze-ingest.yml.)
 name: silver
 
 on:
-  push:                               # every push, on any branch
-  workflow_run:
-    workflows: [bronze-ingest]
-    types: [completed]
   workflow_dispatch:
     inputs:
       env:
@@ -20,10 +15,13 @@ on:
         options: [prod, dev]
         default: prod
 
+# Never run two Spark jobs at the same time (same group as bronze-ingest.yml).
+concurrency:
+  group: inmet-spark
+  cancel-in-progress: false
+
 jobs:
   silver:
-    # after Bronze: only if Bronze succeeded (push and the button always run)
-    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
     runs-on: [self-hosted, linux, openstack]
     env:
       DATA_ROOT: /data/inmet
@@ -43,7 +41,7 @@ jobs:
           free -h
           ps aux | grep -i [j]ava || echo "no other Java/Spark running"
 
-      - name: Build Silver (2023, 2024, 2025)
+      - name: Build Silver (2024, 2025)
         env:
           DAT535_OUTPUT_DIR: ${{ env.DATA_ROOT }}/lake/${{ env.LAKE_ENV }}
-        run: $DATA_ROOT/venv/bin/python -m silver.silver_build --env "$LAKE_ENV" --years 2023 2024 2025
+        run: $DATA_ROOT/venv/bin/python -m silver.silver_build --env "$LAKE_ENV" --years 2024 2025

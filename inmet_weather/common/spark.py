@@ -30,3 +30,41 @@ def start_spark(app_name, lake, memory="4g"):
              .getOrCreate())
     spark.sparkContext.setLogLevel("WARN")
     return spark
+
+
+def save_to_staging(spark, table, name):
+    # Step A of saving: write the new rows to a "<name>_new" table first.
+    # The real table is not touched yet, so if the job crashes here
+    # (for example out of memory), the old data is still fine.
+    database = name.split(".")[0]
+    spark.sql(f"CREATE DATABASE IF NOT EXISTS {database}")
+    table.write.mode("overwrite").format("parquet").saveAsTable(f"{name}_new")
+
+
+def move_from_staging(spark, name, years=None):
+    # Step B of saving: put the rows from "<name>_new" into the real table,
+    # then delete "<name>_new".
+    # - Tables with a source_year column are split into one part per year.
+    # - years=None: replace the whole table.
+    # - years=[2025]: delete only the 2025 part and add the new 2025 rows,
+    #   the other years are not touched.
+    # Running the same job twice gives the same result (no double rows).
+    new_rows = spark.table(f"{name}_new")
+    writer = new_rows.write.format("parquet")
+    if "source_year" in new_rows.columns:
+        writer = writer.partitionBy("source_year")
+
+    if years and spark.catalog.tableExists(name):
+        for year in years:
+            spark.sql(f"ALTER TABLE {name} DROP IF EXISTS PARTITION (source_year={year})")
+        writer.mode("append").saveAsTable(name)
+    else:
+        writer.mode("overwrite").saveAsTable(name)
+    spark.sql(f"DROP TABLE {name}_new")
+
+
+def save_table(spark, table, name, years=None):
+    # Save a DataFrame as a Spark table, e.g. name = "silver.inmet_hourly":
+    # first to "<name>_new" (step A), then into the real table (step B).
+    save_to_staging(spark, table, name)
+    move_from_staging(spark, name, years)

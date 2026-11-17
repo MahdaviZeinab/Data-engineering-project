@@ -4,12 +4,14 @@ Bronze layer: load the INMET weather CSV files into Spark tables.
 Bronze keeps the data as it is. We only:
   1. cut every line into its 19 values (all kept as text, nothing is changed),
   2. add where each row came from (file, line number) and when we loaded it,
-  3. put lines we can not cut into 19 values in a quarantine table.
+  3. put bad lines in a quarantine table, with the reason: lines without 19 values,
+     and all lines of a file whose header (line 9) is not what INMET promised.
 
 Tables (all in the Spark database "bronze", split by year):
   bronze.inmet_hourly      one row per station and hour
-  bronze.inmet_files       one row per CSV file: station info and row counts
-  bronze.inmet_quarantine  lines with the wrong number of values
+  bronze.inmet_files       one row per CSV file: station info, row counts and a status
+  bronze.inmet_quarantine  bad lines and the reason
+  bronze.runs              one row per run: when, which years, how many files and rows
 
 Silver reads them by name, for example:  spark.table("bronze.inmet_hourly")
 
@@ -28,7 +30,7 @@ from pathlib import Path
 
 from pyspark.sql import functions as F
 
-from common.spark import start_spark
+from common.spark import move_from_staging, save_to_staging, start_spark
 
 
 # ---------------------------------------------------------------------------
@@ -80,7 +82,6 @@ EXPECTED_HEADER = ";".join(INMET_COLUMNS)        # line 9 as INMET writes it
 DATABASE = "bronze"
 
 
-# ---------------------------------------------------------------------------
 # Step 1: read the files
 # ---------------------------------------------------------------------------
 def find_years(source):
@@ -125,12 +126,21 @@ def add_station_code(files):
             .withColumn("end_date", F.to_date(F.element_at(name_parts, -1), "dd-MM-yyyy")))
 
 
+def check_header(files):
+    # Check line 9 of every file: it must be the 19 column names INMET promised.
+    # If not, the values could land in the wrong columns (rain in temperature),
+    # so later all lines of that file go to quarantine.
+    line_9 = F.element_at(F.split("text", "\r?\n"), 9)
+    header = F.regexp_replace(line_9, ";$", "")      # remove the ";" at the end
+    return files.withColumn("header_ok", F.coalesce(header == EXPECTED_HEADER, F.lit(False)))
+
+
 def split_into_lines(files):
     # Turn "one row per file" into "one row per line of the file".
     # We also keep the line number, so every row can be found again in the file.
     lines = F.split("text", "\r?\n")
     return (files
-            .select("source_year", "source_file", "station_code",
+            .select("source_year", "source_file", "station_code", "header_ok",
                     F.posexplode(lines).alias("index", "line"))
             .withColumn("source_line_number", F.col("index") + 1)
             .drop("index"))
@@ -142,7 +152,6 @@ def only_data_lines(lines):
     return lines.where((F.col("source_line_number") >= FIRST_DATA_LINE) & (F.col("line") != ""))
 
 
-# ---------------------------------------------------------------------------
 # Step 2: make the three tables
 # ---------------------------------------------------------------------------
 def has_19_values(line):
@@ -152,11 +161,20 @@ def has_19_values(line):
     return number_of_values.isin(19, 20)
 
 
+def find_problems(lines):
+    # Give every data line a "problem" column. Empty (null) means the line is good.
+    #   - the file has a wrong header      -> "unexpected header"
+    #   - the line does not have 19 values -> "wrong number of values"
+    problem = (F.when(~F.col("header_ok"), "unexpected header")
+                .when(~has_19_values("line"), "wrong number of values"))
+    return lines.withColumn("problem", problem)
+
+
 def make_hourly(lines):
-    # Make the hourly table: one row per station and hour.
+    # Make the hourly table from the good lines: one row per station and hour.
     # Each line is cut at ";" into the 19 values. The values stay text,
     # exactly as INMET wrote them (for example "25,5" or "-9999").
-    good_lines = lines.where(has_19_values("line"))
+    good_lines = lines.where(F.col("problem").isNull())
     values = F.split("line", ";")
     columns = []
     for number, name in enumerate(COLUMNS, start=1):
@@ -166,13 +184,12 @@ def make_hourly(lines):
 
 
 def make_quarantine(lines):
-    # Make the quarantine table: the data lines we could NOT cut into 19 values.
+    # Make the quarantine table: the lines that have a problem.
     # We keep the whole line and the reason, so we never lose data silently.
-    bad_lines = lines.where(~has_19_values("line"))
+    bad_lines = lines.where(F.col("problem").isNotNull())
     return bad_lines.select("source_year", "station_code", "source_file",
                             "source_line_number",
-                            F.col("line").alias("raw_line"),
-                            F.lit("wrong number of values").alias("problem"))
+                            F.col("line").alias("raw_line"), "problem")
 
 
 def make_files_table(files, hourly, quarantine):
@@ -180,16 +197,13 @@ def make_files_table(files, hourly, quarantine):
     # from lines 1-8 and a simple check that the file is complete.
     lines = F.split("text", "\r?\n")
     table = files.select("source_year", "source_file", "station_code",
-                         "start_date", "end_date", "text")
+                         "start_date", "end_date", "header_ok", "text")
 
     # Lines 1-8 look like "ESTACAO:;BRASILIA". We keep the part after ";".
     for line_number, name in STATION_INFO.items():
         line = F.element_at(lines, line_number)
         table = table.withColumn(name, F.trim(F.split(line, ";").getItem(1)))
-
-    # Line 9 should be the 19 column names INMET promised.
-    header = F.regexp_replace(F.element_at(lines, 9), ";$", "")
-    table = table.withColumn("header_ok", header == EXPECTED_HEADER).drop("text")
+    table = table.drop("text")
 
     # How many hours should be in the file (24 per day), and how many we got.
     days = F.datediff("end_date", "start_date") + 1
@@ -197,7 +211,23 @@ def make_files_table(files, hourly, quarantine):
     table = table.join(count_hours(hourly), "source_file", "left")
     table = table.join(count_bad_lines(quarantine), "source_file", "left")
     table = table.fillna(0, ["received_rows", "received_hours", "quarantined_lines"])
-    return table.withColumn("missing_hours", F.col("expected_hours") - F.col("received_hours"))
+    table = table.withColumn("missing_hours", F.col("expected_hours") - F.col("received_hours"))
+    return add_status(table)
+
+
+def add_status(table):
+    # Give every file one simple status, so we see at once if it is OK:
+    #   QUARANTINED           wrong header, all lines went to quarantine
+    #   INCOMPLETE            some hours are missing
+    #   COMPLETE_WITH_ISSUES  all hours are there, but some are double or some lines were bad
+    #   COMPLETE              everything is fine
+    has_issues = ((F.col("received_rows") != F.col("received_hours"))
+                  | (F.col("quarantined_lines") > 0))
+    status = (F.when(~F.col("header_ok"), "QUARANTINED")
+               .when(F.col("missing_hours") != 0, "INCOMPLETE")
+               .when(has_issues, "COMPLETE_WITH_ISSUES")
+               .otherwise("COMPLETE"))
+    return table.withColumn("status", status)
 
 
 def count_hours(hourly):
@@ -232,26 +262,6 @@ def git_version():
         return "unknown"
 
 
-# ---------------------------------------------------------------------------
-# Step 3: save the tables in Spark
-# ---------------------------------------------------------------------------
-def save_table(spark, table, name, years):
-    # Save a table in Spark, split into one part per year (source_year).
-    # If the table is already there, we first delete the years we load again,
-    # then add the new rows. The other years are not touched.
-    # So running the job twice gives the same result (no double rows).
-    full_name = f"{DATABASE}.{name}"
-    if spark.catalog.tableExists(full_name):
-        for year in years:
-            spark.sql(f"ALTER TABLE {full_name} DROP IF EXISTS PARTITION (source_year={year})")
-    (table.write
-          .mode("append")
-          .format("parquet")
-          .partitionBy("source_year")
-          .saveAsTable(full_name))
-
-
-# ---------------------------------------------------------------------------
 # The whole Bronze job
 # ---------------------------------------------------------------------------
 def run_bronze(spark, source, years=None, run_id=None):
@@ -264,35 +274,81 @@ def run_bronze(spark, source, years=None, run_id=None):
     print(f"BRONZE: loading years {years} (run {run_id})")
 
     # read every file only once, the next steps all use it
-    files = add_station_code(read_files(spark, source, years)).cache()
-    lines = only_data_lines(split_into_lines(files))
+    files = check_header(add_station_code(read_files(spark, source, years))).cache()
+    lines = find_problems(only_data_lines(split_into_lines(files)))
 
     hourly = make_hourly(lines)
     quarantine = make_quarantine(lines)
     files_table = make_files_table(files, hourly, quarantine)
+    tables = {
+        "bronze.inmet_hourly": add_load_info(hourly, run_id, load_time),
+        "bronze.inmet_quarantine": add_load_info(quarantine, run_id, load_time),
+        "bronze.inmet_files": add_load_info(files_table, run_id, load_time),
+    }
 
-    spark.sql(f"CREATE DATABASE IF NOT EXISTS {DATABASE}")
-    save_table(spark, add_load_info(hourly, run_id, load_time), "inmet_hourly", years)
-    save_table(spark, add_load_info(quarantine, run_id, load_time), "inmet_quarantine", years)
-    save_table(spark, add_load_info(files_table, run_id, load_time), "inmet_files", years)
+    # Step A: write all three tables to "<name>_new" tables and check them.
+    # If anything goes wrong here, the real tables are not touched.
+    for name, table in tables.items():
+        save_to_staging(spark, table, name)
     files.unpersist()
+    check_new_tables(spark, years)
 
+    # Step B: everything is fine, so now replace the years in the real tables.
+    for name in tables:
+        move_from_staging(spark, name, years)
+
+    save_run_report(spark, run_id, load_time, years)
     print_summary(spark, years)
+
+
+def check_new_tables(spark, years):
+    # Check the new tables before they replace the old ones:
+    #   - every year we load must have at least one file
+    #     (otherwise we would delete that year and put nothing back)
+    #   - every data line must be in the hourly table OR in quarantine
+    files = spark.table("bronze.inmet_files_new")
+    for year in years:
+        if files.where(F.col("source_year") == year).count() == 0:
+            raise ValueError(f"no files found for {year}; nothing was replaced")
+
+    lines_in_files = files.agg(F.sum("received_rows") + F.sum("quarantined_lines")).first()[0]
+    lines_saved = (spark.table("bronze.inmet_hourly_new").count()
+                   + spark.table("bronze.inmet_quarantine_new").count())
+    if lines_in_files != lines_saved:
+        raise ValueError(f"expected {lines_in_files} lines but saved {lines_saved}; "
+                         "nothing was replaced")
+
+
+def save_run_report(spark, run_id, load_time, years):
+    # Add one row about this run to the table bronze.runs:
+    # when it ran, which years, and how many files and rows it loaded.
+    # So we can always see the history of all runs.
+    files = spark.table("bronze.inmet_files").where(F.col("source_year").isin(years))
+    report = files.agg(
+        F.lit(run_id).alias("run_id"),
+        F.lit(load_time).cast("timestamp").alias("run_time"),
+        F.lit(" ".join(str(y) for y in years)).alias("years"),
+        F.count("*").alias("files"),
+        F.sum((F.col("status") == "COMPLETE").cast("int")).alias("complete_files"),
+        F.sum((F.col("status") != "COMPLETE").cast("int")).alias("files_with_problems"),
+        F.sum("received_rows").alias("hourly_rows"),
+        F.sum("quarantined_lines").alias("quarantined_lines"),
+    )
+    report.write.mode("append").format("parquet").saveAsTable("bronze.runs")
 
 
 def print_summary(spark, years):
     # Print a short report in the log: how many rows each table has now,
-    # and which files have missing or double hours, bad lines or a strange header.
+    # how many files have each status, and the files that need a look.
     for name in ["inmet_hourly", "inmet_files", "inmet_quarantine"]:
         rows = spark.table(f"{DATABASE}.{name}").where(F.col("source_year").isin(years)).count()
         print(f"BRONZE: {DATABASE}.{name} has {rows} rows for {years}")
 
     files = spark.table(f"{DATABASE}.inmet_files").where(F.col("source_year").isin(years))
-    problems = files.where((F.col("missing_hours") != 0) | ~F.col("header_ok")
-                           | (F.col("received_rows") != F.col("received_hours"))
-                           | (F.col("quarantined_lines") > 0))
+    files.groupBy("status").count().show()
+    problems = files.where(F.col("status") != "COMPLETE")
     print(f"BRONZE: {problems.count()} files need a look:")
-    problems.select("source_year", "source_file", "header_ok", "expected_hours",
+    problems.select("source_year", "source_file", "status", "expected_hours",
                     "received_hours", "missing_hours", "received_rows", "quarantined_lines") \
             .show(20, truncate=False)
 

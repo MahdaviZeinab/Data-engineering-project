@@ -139,13 +139,13 @@ def test_latest_station(spark):
 
 
 # ---------------------------------------------------------------- whole step
-def test_build_stations_publishes_both_tables(spark, tmp_path):
+def test_build_stations_saves_both_tables(spark):
     spark.sql("CREATE DATABASE IF NOT EXISTS bronze")
     files(spark, [("A001", 2020, {}), ("A001", 2021, {}), ("A002", 2021, {})]) \
         .write.mode("overwrite").partitionBy("source_year").saveAsTable("bronze.inmet_files")
-    build_stations(spark, str(tmp_path), "test")
-    history = spark.read.parquet(f"{tmp_path}/silver/station_history")
-    station = spark.read.parquet(f"{tmp_path}/silver/station")
+    build_stations(spark, "test")
+    history = spark.table("silver.station_history")
+    station = spark.table("silver.station")
     assert history.count() == 3
     assert station.count() == 2
     assert station.first()["_silver_run_id"] == "test"

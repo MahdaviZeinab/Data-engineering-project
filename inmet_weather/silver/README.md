@@ -1,7 +1,8 @@
 # Silver layer
 
-Reads the Spark tables `bronze.inmet_hourly` and `bronze.inmet_files` (with `spark.table`) and writes `data/lake/<env>/silver/`.
-One row in `silver/weather_hourly` = one station, one hour.
+Reads the Spark tables `bronze.inmet_hourly` and `bronze.inmet_files` (with `spark.table`) and saves
+the Spark tables `silver.inmet_hourly`, `silver.station_history` and `silver.station` (with `saveAsTable`).
+One row in `silver.inmet_hourly` = one station, one hour.
 
 All rules live in [`contract.py`](contract.py). The job reads them from there, so this README and the code agree.
 
@@ -89,8 +90,8 @@ Bronze keeps them in the table `bronze.inmet_files` (one row per file = one stat
 
 | Table | One row = | What it holds |
 |---|---|---|
-| `silver/station_history` | one station, one year | station info as that year's file said it, plus `name_changed`, `location_changed`, `in_brazil`, `timezone` |
-| `silver/station` | one station | the latest info, plus `first_year`, `last_year`, `years`, `name_changes`, `location_changes` |
+| `silver.station_history` | one station, one year | station info as that year's file said it, plus `name_changed`, `location_changed`, `in_brazil`, `timezone` |
+| `silver.station` | one station | the latest info, plus `first_year`, `last_year`, `years`, `name_changes`, `location_changes` |
 
 | Rule | Value | Why |
 |---|---|---|

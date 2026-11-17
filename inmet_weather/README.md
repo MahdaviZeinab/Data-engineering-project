@@ -5,13 +5,13 @@ Batch processing with Apache Spark and GitHub Actions.
 
 ```
 INMET website ─► bronze/injection.py ─► data/raw/<year>/*.CSV ─► bronze/bronze_ingest.py ─► Spark tables bronze.*
-                                                     silver/ reads spark.table("bronze.inmet_hourly") ─► silver
+                                                     silver/ reads spark.table("bronze.inmet_hourly") ─► Spark tables silver.*
                                                      gold/   (later)
 ```
 
 Each layer saves its result as **Spark tables** (`saveAsTable`, Parquet, split by year).
 The next layer reads them by name with `spark.table(...)`, not from a folder path.
-Every layer starts Spark with `common/spark.py`, so they all see the same tables.
+Every layer starts Spark and saves its tables with `common/spark.py`, so they all see the same tables.
 
 ## Folders
 
@@ -21,7 +21,8 @@ inmet_weather/
 │   ├── injection.py        download + unzip the yearly INMET files
 │   └── bronze_ingest.py    Spark job: raw files -> Bronze Spark tables
 ├── common/
-│   └── spark.py            starts Spark so every layer sees the same tables
+│   ├── spark.py            start_spark() + save_table(): every layer uses the same Spark tables
+│   └── checks.py           small checks we run on a table before we save it
 ├── silver/                 Silver layer (next step)
 ├── gold/                   Gold layer (later)
 ├── tests/                  tests for all layers
@@ -61,10 +62,14 @@ If `DAT535_OUTPUT_DIR` is set (as in the course lab CI), the output goes there.
 | Spark table | One row per | Content |
 |---|---|---|
 | `bronze.inmet_hourly` | station-hour | the 19 values as text (as INMET wrote them), source file, line number, `_bronze_*` columns |
-| `bronze.inmet_files` | source file | station info (lines 1-8), header check, expected / received / missing hours |
+| `bronze.inmet_files` | source file | station info (lines 1-8), header check, expected / received / missing hours, `status` (COMPLETE, COMPLETE_WITH_ISSUES, INCOMPLETE, QUARANTINED) |
 | `bronze.inmet_quarantine` | bad line | the raw line and the problem |
+| `bronze.runs` | run | when it ran, which years, how many files and rows |
 
 All tables are Parquet, split by `source_year`. Loading one year again only replaces that year.
+Saving happens in two steps: first all new rows go to `<table>_new` tables and are checked,
+and only then do they replace the old years. If the job crashes or a check fails in step one,
+the old data is not touched.
 Column names are simple versions of the Portuguese names (Spark tables do not allow commas
 in column names); the values are not changed.
 

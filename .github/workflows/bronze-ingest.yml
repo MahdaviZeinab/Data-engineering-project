@@ -1,10 +1,11 @@
-# Bronze batch run on the OpenStack VM (self-hosted runner).
-#   1. download + unzip the INMET yearly files   (bronze/injection.py)
-#   2. load them into the Bronze tables with Spark (bronze/bronze_ingest.py)
+# Bronze + Silver batch run on the OpenStack VM (self-hosted runner).
+#   job "ingest":  1. download + unzip the INMET yearly files   (bronze/injection.py)
+#                  2. load them into the Bronze tables with Spark (bronze/bronze_ingest.py)
+#   job "silver":  3. run the tests, 4. build the Silver tables  (only if Bronze worked)
 #
 # When does it run?
-#   - automatically after every push to main
-#   - by hand: Actions tab -> bronze-ingest -> Run workflow
+#   - automatically after every push, on any branch: years 2024 and 2025 (for now)
+#   - by hand: Actions tab -> bronze-ingest -> Run workflow (choose the years)
 #
 # Runs on the runner that has the labels  self-hosted + linux + openstack.
 # The data is kept OUTSIDE the GitHub work folder, in DATA_ROOT on the VM, so it
@@ -16,22 +17,22 @@
 name: bronze-ingest
 
 on:
-  #push:
-  #  branches: [main]
+  push:                                # every push, on any branch
   workflow_dispatch:                   # "Run workflow" button in the Actions tab
     inputs:
       years:
         description: "Year(s) to ingest, separated by spaces, e.g. 2025 or 2020 2021 2022"
-        default: "2020 2021 2022 2023 2024 2025"
+        default: "2024 2025"
       env:
         description: "Output environment"
         type: choice
         options: [prod, dev]
         default: prod
 
-# Never run two ingests at the same time on the same data.
+# Never run two Spark jobs at the same time on the same data
+# (the same group is used in silver.yml).
 concurrency:
-  group: bronze-ingest
+  group: inmet-spark
   cancel-in-progress: false
 
 jobs:
@@ -40,7 +41,7 @@ jobs:
     timeout-minutes: 240
     env:
       DATA_ROOT: /data/inmet           # folder on the VM (see the setup guide)
-      YEARS: ${{ inputs.years || '2020 2021 2022 2023 2024 2025' }}   # after a push: all years
+      YEARS: ${{ inputs.years || '2024 2025' }}   # after a push: 2024 and 2025
       LAKE_ENV: ${{ inputs.env || 'prod' }}
     defaults:
       run:
@@ -87,3 +88,24 @@ jobs:
         env:
           DAT535_OUTPUT_DIR: ${{ env.DATA_ROOT }}/lake/${{ env.LAKE_ENV }}
         run: python -m bronze.bronze_ingest --source "$DATA_ROOT/raw" --env "$LAKE_ENV" --years $YEARS
+
+  silver:
+    needs: ingest                      # starts only when Bronze worked
+    runs-on: [self-hosted, linux, openstack]
+    env:
+      DATA_ROOT: /data/inmet
+      YEARS: ${{ inputs.years || '2024 2025' }}
+      LAKE_ENV: ${{ inputs.env || 'prod' }}
+    defaults:
+      run:
+        working-directory: inmet_weather
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run the tests
+        run: $DATA_ROOT/venv/bin/python -m pytest -q
+
+      - name: Build Silver
+        env:
+          DAT535_OUTPUT_DIR: ${{ env.DATA_ROOT }}/lake/${{ env.LAKE_ENV }}
+        run: $DATA_ROOT/venv/bin/python -m silver.silver_build --env "$LAKE_ENV" --years $YEARS

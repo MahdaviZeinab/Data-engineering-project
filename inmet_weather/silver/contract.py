@@ -120,7 +120,7 @@ BRAZIL_BOX = {"lat": (-34.0, 5.5), "lon": (-74.5, -28.5)}
 
 
 def check_schema(columns):
-    """Stop the Silver job if Bronze has a missing or a new column."""
+    # Stop the Silver job if Bronze has a missing or a new column.
     missing = [c for c in BRONZE_COLUMNS if c not in columns]
     new = [c for c in columns if c not in BRONZE_COLUMNS]
     if missing or new:

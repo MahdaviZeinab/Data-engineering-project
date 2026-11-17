@@ -80,8 +80,8 @@ def files_by_station(spark, year=2020):
 def test_tables_are_saved_in_spark(spark, source):
     run_bronze(spark, source)
     names = [t.name for t in spark.catalog.listTables("bronze")]
-    assert sorted(names) == ["inmet_files", "inmet_hourly", "inmet_quarantine"]
-    assert spark.table(HOURLY).count() == 48 + 41 + 24 + 24
+    assert sorted(names) == ["inmet_files", "inmet_hourly", "inmet_quarantine", "runs"]
+    assert spark.table(HOURLY).count() == 48 + 41 + 24      # not the 24 rows of A003
 
 
 def test_values_stay_raw_and_accents_survive(spark, source):
@@ -106,14 +106,24 @@ def test_files_table_counts_hours(spark, source):
     assert files["A002"]["quarantined_lines"] == 1
     assert files["A001"]["header_ok"] is True
     assert files["A003"]["header_ok"] is False
+    assert files["A003"]["received_hours"] == 0 and files["A003"]["quarantined_lines"] == 24
 
 
 def test_broken_line_goes_to_quarantine(spark, source):
     run_bronze(spark, source)
-    bad = spark.table(QUARANTINE).collect()
+    bad = spark.table(QUARANTINE).where("problem = 'wrong number of values'").collect()
     assert len(bad) == 1
     assert bad[0]["raw_line"] == "2020/01/02;1700 UTC;0;1"
     assert bad[0]["source_file"].startswith("INMET_SE_SP_A002")
+
+
+def test_file_with_wrong_header_goes_to_quarantine(spark, source):
+    run_bronze(spark, source)
+    # none of its rows are in the hourly table, all 24 are in quarantine
+    assert spark.table(HOURLY).where("station_code = 'A003'").count() == 0
+    bad = spark.table(QUARANTINE).where("station_code = 'A003'")
+    assert bad.count() == 24
+    assert [r[0] for r in bad.select("problem").distinct().collect()] == ["unexpected header"]
 
 
 def test_running_twice_gives_the_same_result(spark, source):
@@ -131,3 +141,49 @@ def test_loading_one_year_keeps_the_other_years(spark, source):
     runs = {r["source_year"]: r["_bronze_run_id"]
             for r in spark.table(HOURLY).select("source_year", "_bronze_run_id").distinct().collect()}
     assert runs == {2020: "all", 2021: "only_2021"}
+
+
+def test_every_file_gets_a_status(spark, source):
+    run_bronze(spark, source)
+    status = {code: r["status"] for code, r in files_by_station(spark).items()}
+    assert status == {"A001": "COMPLETE", "A002": "INCOMPLETE", "A003": "QUARANTINED"}
+
+
+def test_every_run_is_in_the_runs_table(spark, source):
+    run_bronze(spark, source, run_id="first")
+    run_bronze(spark, source, years=[2021], run_id="second")
+    runs = {r["run_id"]: r for r in spark.table("bronze.runs").collect()}
+    assert set(runs) == {"first", "second"}
+    assert runs["second"]["years"] == "2021" and runs["second"]["files"] == 1
+
+
+def test_crash_while_writing_keeps_the_old_data(spark, source, monkeypatch):
+    run_bronze(spark, source, run_id="good")
+
+    # pretend the job crashes while it writes the LAST new table
+    import bronze.bronze_ingest as bronze_ingest
+    real = bronze_ingest.save_to_staging
+
+    def crash(spark, table, name):
+        if name == "bronze.inmet_files":
+            raise RuntimeError("simulated crash")
+        real(spark, table, name)
+
+    monkeypatch.setattr(bronze_ingest, "save_to_staging", crash)
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        run_bronze(spark, source, run_id="bad")
+
+    # all three tables still have the data of the "good" run
+    for table in [HOURLY, FILES, QUARANTINE]:
+        ids = [r[0] for r in spark.table(table).select("_bronze_run_id").distinct().collect()]
+        assert ids == ["good"], table
+
+
+def test_year_without_files_stops_and_keeps_the_old_data(spark, source, tmp_path):
+    run_bronze(spark, source, run_id="good")
+    (tmp_path / "raw" / "2022").mkdir()                      # an empty year folder
+    (tmp_path / "raw" / "2022" / "readme.txt").write_text("not a CSV")
+    with pytest.raises(Exception):
+        run_bronze(spark, source, years=[2021, 2022], run_id="bad")
+    ids = [r[0] for r in spark.table(HOURLY).select("_bronze_run_id").distinct().collect()]
+    assert ids == ["good"]
