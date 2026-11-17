@@ -84,11 +84,27 @@ spark.table("bronze.inmet_files").show()
 
 Note: the table list is kept in a small Derby database (`metastore_db/`), which allows only
 one Spark program at a time. Run Bronze, then Silver, not both at once.
-## GitHub Actions
+## GitHub Actions: dev and prod
 
-The workflow is in `.github/workflows/` at the repository root:
+The workflows are in `.github/workflows/` at the repository root. Both run on our OpenStack VM
+(self-hosted runner, labels `self-hosted, linux, openstack`). Data is kept on the VM in `/data/inmet`.
 
-- `bronze-ingest.yml` runs the Bronze pipeline on our OpenStack VM (self-hosted runner, labels
-  `self-hosted, linux, openstack`). Data is kept on the VM in `/data/inmet`.
+| | Dev | Prod |
+|---|---|---|
+| Workflow | `dev.yml` | `prod.yml` |
+| Runs after | a push to any branch **except** `main` | a push to `main` (a merged Pull Request) |
+| GitHub Environment | `dev` (no rules) | `main` (**Required reviewers**) |
+| Years | 2025 only (fast) | all years 2020-2025 |
+| Writes to | `/data/inmet/lake/dev` | `/data/inmet/lake/prod` |
 
-How to set up the VM and the runner: see [RUNNER_SETUP.md](RUNNER_SETUP.md).
+Each run has two jobs: `bronze` (tests, download, Bronze tables), then `silver` (Silver tables).
+`silver` starts only if `bronze` worked, so Silver always reads the Bronze tables of the same run.
+
+Branch flow:
+
+1. Work on a feature branch and push. The dev pipeline runs and changes only `lake/dev`.
+2. Open a Pull Request into `main` and merge it when dev is green.
+3. The prod pipeline starts and **waits**. A reviewer opens the run in the Actions tab,
+   clicks **Review deployments**, then **Approve and deploy**.
+
+Raw files (`/data/inmet/raw`) and the Python environment (`/data/inmet/venv`) are shared by dev and prod.

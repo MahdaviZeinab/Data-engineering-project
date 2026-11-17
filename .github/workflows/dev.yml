@@ -1,0 +1,106 @@
+# DEV pipeline on the OpenStack VM (self-hosted runner).
+#
+# When does it run?
+#   - automatically after every push to any branch EXCEPT main
+#   - by hand: Actions tab -> "Dev Pipeline" -> Run workflow
+#
+# What is different from prod?
+#   - small data: only 2025, so a run is fast
+#   - writes ONLY to /data/inmet/lake/dev (prod data is never touched)
+#   - no approval needed (GitHub Environment "dev" has no rules)
+#
+# Order: job "bronze" (tests -> download -> Bronze tables)
+#        -> job "silver" (Silver tables), only if Bronze worked.
+name: Dev Pipeline
+
+on:
+  push:
+    branches-ignore: [main]
+  workflow_dispatch:
+
+# Only one dev run at a time (dev has its own Spark table list, metastore_db).
+concurrency:
+  group: inmet-dev
+  cancel-in-progress: false
+
+env:
+  DATA_ROOT: /data/inmet            # folder on the VM, survives between runs
+  LAKE_ENV: dev
+  YEARS: "2025"                     # small on purpose
+
+jobs:
+  bronze:
+    runs-on: [self-hosted, linux, openstack]
+    environment: dev
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: inmet_weather
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check tools and make the data folders on the VM
+        run: |
+          if ! mkdir -p "$DATA_ROOT/raw" "$DATA_ROOT/lake/$LAKE_ENV"; then
+            echo "Cannot create $DATA_ROOT. Run once on the VM:"
+            echo "  sudo mkdir -p $DATA_ROOT && sudo chown \$USER $DATA_ROOT"
+            exit 1
+          fi
+          java -version
+          python3 --version
+          df -h "$DATA_ROOT"
+
+      - name: Python environment (created once, then re-used)
+        run: |
+          if [ ! -x "$DATA_ROOT/venv/bin/python" ]; then
+            python3 -m venv "$DATA_ROOT/venv"
+          fi
+          "$DATA_ROOT/venv/bin/pip" install --quiet --upgrade pip
+          "$DATA_ROOT/venv/bin/pip" install --quiet -r requirements.txt
+          echo "$DATA_ROOT/venv/bin" >> "$GITHUB_PATH"   # later steps use this python
+
+      - name: Run the tests (stop here if the code is broken)
+        run: python -m pytest -q
+
+      - name: Point data/raw to the folder on the VM
+        run: |
+          mkdir -p data
+          ln -sfn "$DATA_ROOT/raw" data/raw
+
+      - name: Land raw files (download + unzip)
+        run: python bronze/injection.py --years $YEARS
+
+      - name: Bronze ingestion (Spark)
+        env:
+          DAT535_OUTPUT_DIR: ${{ env.DATA_ROOT }}/lake/${{ env.LAKE_ENV }}
+        run: python -m bronze.bronze_ingest --source "$DATA_ROOT/raw" --env "$LAKE_ENV" --years $YEARS
+
+  silver:
+    needs: bronze                   # starts only when Bronze worked, same commit
+    runs-on: [self-hosted, linux, openstack]
+    environment: dev
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: inmet_weather
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build Silver
+        env:
+          DAT535_OUTPUT_DIR: ${{ env.DATA_ROOT }}/lake/${{ env.LAKE_ENV }}
+        run: $DATA_ROOT/venv/bin/python -m silver.silver_build --env "$LAKE_ENV" --years $YEARS
+
+      - name: Write run summary
+        if: always()
+        run: |
+          echo "## Dev pipeline run" >> $GITHUB_STEP_SUMMARY
+          echo "| Key | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Run # | ${{ github.run_number }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Environment | $LAKE_ENV |" >> $GITHUB_STEP_SUMMARY
+          echo "| Years | $YEARS |" >> $GITHUB_STEP_SUMMARY
+          echo "| Branch | ${{ github.ref_name }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Commit | ${{ github.sha }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Triggered by | ${{ github.actor }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Result | ${{ job.status }} |" >> $GITHUB_STEP_SUMMARY
