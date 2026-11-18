@@ -1,11 +1,11 @@
 """
 Step 0: download the INMET yearly zip files and unzip the CSV files.
 
-  data/raw/<year>.zip     the original archive (kept as it is)
-  data/raw/<year>/*.CSV   the files the Bronze job reads
-  data/raw/<year>/_DONE   written last: the year is complete
+  data/raw/<year>.zip     the original zip file (kept as it is)
+  data/raw/<year>/*.CSV   the CSV files the Bronze job reads
+  data/raw/<year>/_DONE   written last: it means the year is complete
 
-Safe to run again: finished years are skipped.
+You can run it again at any time: finished years are skipped.
   python bronze/injection.py                # 2020-2025
   python bronze/injection.py --years 2025   # one year
 """
@@ -20,87 +20,78 @@ import requests
 from tqdm import tqdm
 
 URL = "https://portal.inmet.gov.br/uploads/dadoshistoricos/{year}.zip"
-# <project>/data/raw, wherever you start the script from
-FOLDER = Path(__file__).resolve().parents[1] / "data" / "raw"
-# Written last, after all CSV files of a year are unzipped and counted.
-DONE = "_DONE"
+FOLDER = Path(__file__).resolve().parents[1] / "data" / "raw"   # <project>/data/raw
+DONE = "_DONE"      # file we write last, when a year is complete
+TRIES = 3           # how many times we try to download a year
 
 
+# Step 1: download the zip file
+# ---------------------------------------------------------------------------
 def download(year):
+    # Download the zip file of one year. We try up to 3 times, because the
+    # INMET website is sometimes slow. Returns True when the zip is there.
     destination = FOLDER / f"{year}.zip"
-    temporary = FOLDER / f"{year}.zip.part"
     if destination.exists() and zipfile.is_zipfile(destination):
         print(f"{year}: already downloaded.")
         return True
 
-    for attempt in range(1, 4):
+    for attempt in range(1, TRIES + 1):
         try:
-            print(f"{year}: downloading (attempt {attempt}/3)...", flush=True)
-            with requests.get(URL.format(year=year), stream=True, timeout=(30, 120)) as response:
-                response.raise_for_status()
-                size = response.headers.get("Content-Length", "")
-                with temporary.open("wb") as file, tqdm(
-                    total=int(size) if size.isdigit() else None,
-                    desc=str(year), unit="B", unit_scale=True, unit_divisor=1024,
-                ) as progress:
-                    for chunk in response.iter_content(1024 * 1024):
-                        file.write(chunk)
-                        progress.update(len(chunk))
-
-            # Check the zip, and only then give it its final name.
-            with zipfile.ZipFile(temporary) as archive:
-                if archive.testzip() is not None:
-                    raise zipfile.BadZipFile("ZIP integrity check failed.")
-            temporary.replace(destination)
+            print(f"{year}: downloading (attempt {attempt}/{TRIES})...", flush=True)
+            download_once(year, destination)
             return True
         except (requests.RequestException, zipfile.BadZipFile, OSError) as error:
             print(f"{year}: {error}")
             time.sleep(3)
-    print(f"{year}: failed after 3 attempts. Run again to retry.")
+    print(f"{year}: failed after {TRIES} attempts. Run again to retry.")
     return False
 
 
-def unzip(year):
-    """Put every CSV directly in data/raw/<year>/ (only the file name is used,
-    so sub-folders or strange paths inside the zip cannot cause problems).
+def download_once(year, destination):
+    # Download the zip to "<year>.zip.part" first, with a progress bar.
+    # Only when the zip is complete and not broken do we rename it to "<year>.zip".
+    # So a half-downloaded file is never used by mistake.
+    temporary = FOLDER / f"{year}.zip.part"
+    with requests.get(URL.format(year=year), stream=True, timeout=(30, 120)) as response:
+        response.raise_for_status()
+        size = response.headers.get("Content-Length", "")
+        total = int(size) if size.isdigit() else None
+        with temporary.open("wb") as file, tqdm(total=total, desc=str(year), unit="B",
+                                                unit_scale=True, unit_divisor=1024) as bar:
+            for chunk in response.iter_content(1024 * 1024):
+                file.write(chunk)
+                bar.update(len(chunk))
 
-    Crash-safe: files go to data/raw/<year>.tmp/ first. Only when the number of
-    CSV files matches the zip is a _DONE file written and the folder renamed to
-    data/raw/<year>/. A half-finished unzip is never mistaken for a finished one.
-    """
+    check_zip(temporary)
+    temporary.replace(destination)
+
+
+def check_zip(path):
+    # Stop with an error if the zip file is broken.
+    with zipfile.ZipFile(path) as archive:
+        if archive.testzip() is not None:
+            raise zipfile.BadZipFile("ZIP integrity check failed.")
+
+
+# Step 2: unzip the CSV files
+# ---------------------------------------------------------------------------
+def unzip(year):
+    # Unzip all CSV files of one year into data/raw/<year>/.
+    # We unzip into data/raw/<year>.tmp/ first. Only when every file is there
+    # do we write _DONE and rename the folder to data/raw/<year>/.
+    # So Bronze never reads a half-unzipped year.
     target = FOLDER / str(year)
     temporary = FOLDER / f"{year}.tmp"
-    shutil.rmtree(temporary, ignore_errors=True)   # leftovers of a crashed run
+    shutil.rmtree(temporary, ignore_errors=True)    # leftovers of a crashed run
     temporary.mkdir(parents=True)
 
-    with zipfile.ZipFile(FOLDER / f"{year}.zip") as archive:
-        members = [m for m in archive.infolist()
-                   if not m.is_dir() and m.filename.upper().endswith(".CSV")]
-        sources = {}   # file name -> path inside the zip
-        for member in members:
-            name = Path(member.filename).name
-            data = archive.read(member)
-            if name in sources:
-                # Same file name in two zip folders. Bronze needs the exact
-                # INMET name, so we cannot rename it: keep one copy if they are
-                # the same, otherwise stop instead of losing data.
-                if (temporary / name).read_bytes() != data:
-                    raise RuntimeError(
-                        f"{year}: '{member.filename}' and '{sources[name]}' have the "
-                        f"same name but different content. Check the zip by hand.")
-                print(f"{year}: skipped '{member.filename}' (same as '{sources[name]}').")
-                continue
-            sources[name] = member.filename
-            (temporary / name).write_bytes(data)
-
-    if not sources:
+    expected = extract_csv_files(year, temporary)
+    if expected == 0:
         raise RuntimeError(f"{year}: the zip has no CSV files. Check the zip by hand.")
 
-    # Compare with the zip: one file per unique CSV name.
     written = count_csv(temporary)
-    if written != len(sources):
-        raise RuntimeError(f"{year}: zip has {len(sources)} CSV files, "
-                           f"but {written} were written.")
+    if written != expected:
+        raise RuntimeError(f"{year}: zip has {expected} CSV files, but {written} were written.")
     (temporary / DONE).write_text(f"{written}\n")
 
     shutil.rmtree(target, ignore_errors=True)       # old or half-finished folder
@@ -108,12 +99,43 @@ def unzip(year):
     print(f"{year}: {written} CSV files in {target}")
 
 
+def extract_csv_files(year, folder):
+    # Copy every CSV file from the zip straight into the folder.
+    # We only use the file name, so folders inside the zip do not matter.
+    # Returns how many different CSV files the zip has.
+    seen = {}   # file name -> where it was inside the zip
+    with zipfile.ZipFile(FOLDER / f"{year}.zip") as archive:
+        for member in archive.infolist():
+            if member.is_dir() or not member.filename.upper().endswith(".CSV"):
+                continue
+            name = Path(member.filename).name
+            data = archive.read(member)
+            if name in seen:
+                check_same_file(year, folder / name, data, member.filename, seen[name])
+                continue
+            seen[name] = member.filename
+            (folder / name).write_bytes(data)
+    return len(seen)
+
+
+def check_same_file(year, saved_file, data, path_in_zip, first_path):
+    # The zip has the same file name twice (in two folders). Bronze needs the
+    # exact INMET name, so we can not rename it. If both copies are the same,
+    # we keep one. If they are different, we stop, so we do not lose data.
+    if saved_file.read_bytes() != data:
+        raise RuntimeError(f"{year}: '{path_in_zip}' and '{first_path}' have the same name "
+                           "but different content. Check the zip by hand.")
+    print(f"{year}: skipped '{path_in_zip}' (same as '{first_path}').")
+
+
 def count_csv(folder):
+    # How many CSV files are in the folder.
     return len(list(folder.glob("*.[cC][sS][vV]")))
 
 
 def is_unzipped(year):
-    """Finished = _DONE exists and still matches the number of CSV files."""
+    # A year is finished when _DONE exists and still matches the number of CSV files.
+    # (If someone deleted a CSV file later, we unzip the year again.)
     done = FOLDER / str(year) / DONE
     try:
         return int(done.read_text()) == count_csv(done.parent)
@@ -121,7 +143,11 @@ def is_unzipped(year):
         return False
 
 
+# The whole step for one year
+# ---------------------------------------------------------------------------
 def land(year):
+    # Get one year ready for Bronze: download it and unzip it.
+    # Returns True if the year is ready, False if something went wrong.
     if is_unzipped(year):
         print(f"{year}: already unzipped.")
         return True
@@ -135,17 +161,22 @@ def land(year):
         (FOLDER / f"{year}.zip").unlink(missing_ok=True)
         return False
     except (RuntimeError, OSError) as error:
-        # The zip is fine but its content is unexpected, or the disk failed.
+        # The zip is fine, but its content is strange, or the disk had a problem.
         print(error)
         return False
     return True
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
+def main():
+    # Read the years from the command line and get every year ready.
+    parser = argparse.ArgumentParser(description="Download and unzip the INMET files.")
     parser.add_argument("--years", type=int, nargs="*", default=list(range(2020, 2026)))
     years = parser.parse_args().years
     FOLDER.mkdir(parents=True, exist_ok=True)
-    failed = [y for y in years if not land(y)]
+    failed = [year for year in years if not land(year)]
     if failed:
         raise SystemExit(f"Failed years: {failed}")
+
+
+if __name__ == "__main__":
+    main()

@@ -24,8 +24,8 @@ def test_schema_ok():
 
 
 def test_schema_missing_column():
-    with pytest.raises(ValueError, match="Missing: \\['Data'\\]"):
-        check_schema([c for c in BRONZE_COLUMNS if c != "Data"])
+    with pytest.raises(ValueError, match="Missing: \\['data'\\]"):
+        check_schema([c for c in BRONZE_COLUMNS if c != "data"])
 
 
 def test_schema_new_column():
