@@ -4,8 +4,11 @@ from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 
 from silver.contract import BRONZE_COLUMNS, MEASUREMENTS
-from silver.silver_build import (cast_values, count_duplicates, count_not_numeric, make_time,
-                                 remove_duplicates, run_silver)
+import json
+
+from silver.silver_build import (cast_values, count_conflicts, count_duplicates,
+                                 count_not_numeric, make_time, remove_duplicates, run_silver,
+                                 write_run_summary)
 
 TEMP = "temperatura_ar_c"   # becomes temp_c
 
@@ -111,11 +114,13 @@ def test_bad_time_and_unknown_zone_get_a_reason(spark):
 # ---------------------------------------------------------------- Silver 6: duplicates
 def dup_rows(spark, rows):
     """Fake rows after Silver 5: (station, UTC time, source_year, temp_c, ingestion time).
-    All other measurements are 1.0, so only temp_c decides 'fewer missing values'."""
+    All other measurements are 1.0, so only temp_c decides 'fewer missing values'.
+    Each row gets a file name and a line number (row 1 -> line 1, row 2 -> line 2 ...)."""
     others = [m for m in MEASUREMENTS if m != "temp_c"]
-    full = [(*row, *[1.0] * len(others)) for row in rows]
+    full = [(*row, "f.csv", line, *[1.0] * len(others)) for line, row in enumerate(rows, 1)]
     schema = ("station_code string, observed_at_utc string, source_year int, temp_c double, "
-              "_bronze_ingestion_time string, " + ", ".join(f"{m} double" for m in others))
+              "_bronze_ingestion_time string, source_file string, source_line_number int, "
+              + ", ".join(f"{m} double" for m in others))
     return spark.createDataFrame(full, schema).withColumn(
         "observed_at_utc", F.to_timestamp("observed_at_utc"))
 
@@ -162,3 +167,45 @@ def test_count_duplicates(spark):
                           ("B1", H, 2021, 25.0, "t1"),
                           ("A1", None, 2021, 25.0, "t1")])
     assert count_duplicates(df) == 2    # 3 rows of A1 at 05:00 -> 2 extra
+
+
+def test_same_rows_keep_first_line_every_time(spark):
+    # two rows that are equal in everything else: the lower line number wins, always
+    for _ in range(3):
+        df = remove_duplicates(dup_rows(spark, [("A1", H, 2021, 20.0, "t1"),
+                                                ("A1", H, 2021, 30.0, "t1")]))
+        row = df.first()
+        assert (row["source_line_number"], row["temp_c"]) == (1, 20.0)
+
+
+def test_count_conflicts(spark):
+    df = dup_rows(spark, [("A1", H, 2021, 25.0, "t1"),     # A1: same values -> no conflict
+                          ("A1", H, 2021, 25.0, "t2"),
+                          ("B1", H, 2021, 20.0, "t1"),     # B1: 20 vs 30 -> conflict
+                          ("B1", H, 2021, 30.0, "t1"),
+                          ("C1", H, 2021, None, "t1"),     # C1: empty vs 25 -> conflict
+                          ("C1", H, 2021, 25.0, "t1"),
+                          ("D1", H, 2021, 25.0, "t1")])    # D1: only once
+    assert count_conflicts(df) == 2
+
+
+# ---------------------------------------------------------------- Silver 3: run summary
+def test_run_fills_summary(spark):
+    fake_bronze(spark, BRONZE_COLUMNS)
+    summary = {}
+    run_silver(spark, run_id="test", summary=summary)
+    assert summary["bronze_rows"] == 2
+    assert {"not_numeric_values", "duplicates_removed", "duplicate_conflicts"} <= set(summary)
+
+
+def test_write_run_summary(spark, tmp_path):
+    spark.sql("CREATE DATABASE IF NOT EXISTS silver")
+    spark.createDataFrame([(2021, None), (2021, "bad_timestamp")],
+                          "source_year int, dq_issue string") \
+         .write.mode("overwrite").saveAsTable("silver.inmet_hourly")
+    path = write_run_summary(str(tmp_path), "r1", [2021], {"duplicates_removed": 3}, spark)
+    saved = json.loads(path.read_text())
+    assert path.name == "silver_r1.json"
+    assert saved["duplicates_removed"] == 3
+    assert saved["silver_rows_per_year"] == {"2021": 2}
+    assert saved["rows_per_dq_issue"] == {"ok": 1, "bad_timestamp": 1}

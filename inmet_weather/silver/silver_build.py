@@ -9,6 +9,7 @@ Steps:
   5. remove double rows (same station and same hour)
   6. make the station tables (see stations.py)
   7. save all three Silver tables together (if one fails, none is changed)
+  8. write a small run summary (counts) to <lake>/_runs/silver_<run_id>.json
 
 All rules (names, missing codes, time zones ...) are in silver/contract.py.
 
@@ -19,6 +20,7 @@ Run (from the inmet_weather folder):
 """
 
 import argparse
+import json
 import os
 import sys
 from datetime import datetime, timezone
@@ -123,17 +125,31 @@ def count_duplicates(df):
     return rows.count() - rows.distinct().count()
 
 
+def count_conflicts(df):
+    # Count the station-hours that are in Bronze more than once WITH DIFFERENT values
+    # (a real conflict: two files say different things about the same hour).
+    # 0 is a good result. If it is not 0, we look at a few examples in the report.
+    rows = df.where(F.col("observed_at_utc").isNotNull())
+    values = F.to_json(F.struct(*contract.MEASUREMENTS))      # all 17 values as one text
+    per_key = rows.groupBy(*contract.KEY).agg(F.countDistinct(values).alias("versions"))
+    return per_key.where(F.col("versions") > 1).count()
+
+
 def remove_duplicates(df):
     # Keep only one row per station and hour. We keep the best row:
-    #   1. the date is in the same year as the file it came from
+    #   1. the hour is inside the file's own dates. Every INMET file covers one year,
+    #      so "same year as the file" is our simple test for this. The "extra hours"
+    #      (for example 1 January of the next year) lose against the next year's file.
     #   2. it has fewer empty values
     #   3. it was loaded last
+    #   4. file name and line number, so two runs always keep the same row
     # Rows without a time are all kept (we can not compare them).
     right_year = (F.year("observed_at_utc") == F.col("source_year")).cast("int")
     empty_values = sum(F.col(c).isNull().cast("int") for c in contract.MEASUREMENTS)
     best_first = (Window.partitionBy(*contract.KEY)
                   .orderBy(right_year.desc(), empty_values.asc(),
-                           F.col("_bronze_ingestion_time").desc()))
+                           F.col("_bronze_ingestion_time").desc(),
+                           F.col("source_file").asc(), F.col("source_line_number").asc()))
 
     df = df.withColumn("rank", F.row_number().over(best_first))
     keep = (F.col("rank") == 1) | F.col("observed_at_utc").isNull()
@@ -161,16 +177,23 @@ def add_station(df, files):
 # ---------------------------------------------------------------------------
 # The whole Silver job
 # ---------------------------------------------------------------------------
-def run_silver(spark, years=None, run_id=None):
+def run_silver(spark, years=None, run_id=None, summary=None):
     # Do all the cleaning steps, one after the other, and return the clean table.
+    # If you give a dict as "summary", the counts of this run are put in it.
     run_id = run_id or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    summary = {} if summary is None else summary
     hourly, files = read_bronze(spark, years)
 
     df = check_schema(hourly)
-    print("SILVER: values that are not numbers:", count_not_numeric(df))
+    summary["bronze_rows"] = df.count()
+    summary["not_numeric_values"] = count_not_numeric(df)
+    print("SILVER: values that are not numbers:", summary["not_numeric_values"])
     df = cast_values(df)
     df = make_time(df, files)
-    print("SILVER: double rows removed:", count_duplicates(df))
+    summary["duplicates_removed"] = count_duplicates(df)
+    summary["duplicate_conflicts"] = count_conflicts(df)
+    print("SILVER: double rows removed:", summary["duplicates_removed"],
+          "| with different values:", summary["duplicate_conflicts"])
     df = remove_duplicates(df)
     df = apply_value_rules(df)
     df = quarantine_rows(df)
@@ -192,6 +215,29 @@ def save_silver(spark, silver, years, run_id):
     for name in STATION_TABLES:
         tables[name] = None
     move_all_from_staging(spark, tables)
+
+
+def write_run_summary(lake, run_id, years, summary, spark):
+    # Silver 3: save the numbers of this run as a small JSON file, one file per run,
+    # so the report can show them and we can compare runs.
+    # Example: <lake>/_runs/silver_20251119T180000Z.json
+    result = spark.table("silver.inmet_hourly")
+    summary = {
+        "run_id": run_id,
+        "years": years or "all",
+        "finished_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        **summary,
+        "silver_rows_per_year": {str(r["source_year"]): r["count"]
+                                 for r in result.groupBy("source_year").count().collect()},
+        "rows_per_dq_issue": {str(r["dq_issue"] or "ok"): r["count"]
+                              for r in result.groupBy("dq_issue").count().collect()},
+    }
+    folder = Path(lake) / "_runs"
+    folder.mkdir(parents=True, exist_ok=True)
+    path = folder / f"silver_{run_id}.json"
+    path.write_text(json.dumps(summary, indent=2, sort_keys=True))
+    print("SILVER: run summary saved in", path)
+    return path
 
 
 def print_summary(spark):
@@ -221,9 +267,11 @@ def main():
         check_tables_match(spark)
 
         run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        silver = run_silver(spark, args.years, run_id)
+        summary = {}
+        silver = run_silver(spark, args.years, run_id, summary)
         save_silver(spark, silver, args.years, run_id)
         print("SILVER: saved silver.inmet_hourly, silver.station_history, silver.station")
+        write_run_summary(lake, run_id, args.years, summary, spark)
         print_summary(spark)
         return 0
     except Exception as error:
