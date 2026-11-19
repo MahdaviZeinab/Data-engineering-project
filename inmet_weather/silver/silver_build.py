@@ -7,8 +7,8 @@ Steps:
   3. turn the text values into numbers ("25,5" -> 25.5, "-9999" -> empty)
   4. make the time: UTC time and the station's local time
   5. remove double rows (same station and same hour)
-  6. save the result as the Spark table silver.inmet_hourly
-  7. make the station tables (see stations.py)
+  6. make the station tables (see stations.py)
+  7. save all three Silver tables together (if one fails, none is changed)
 
 All rules (names, missing codes, time zones ...) are in silver/contract.py.
 
@@ -28,9 +28,10 @@ from pyspark.sql import functions as F
 from pyspark.sql.window import Window
 
 from common.checks import has_columns, not_empty, run_checks
-from common.spark import save_table, start_spark
+from bronze.bronze_ingest import check_tables_match
+from common.spark import move_all_from_staging, save_to_staging, start_spark
 from silver import contract
-from silver.stations import build_stations, station_timezones
+from silver.stations import STATION_TABLES, stage_stations, station_timezones
 
 
 # ---------------------------------------------------------------------------
@@ -177,6 +178,22 @@ def run_silver(spark, years=None, run_id=None):
     return df.withColumn("_silver_run_id", F.lit(run_id))
 
 
+def save_silver(spark, silver, years, run_id):
+    # Save all three Silver tables TOGETHER, like Bronze does:
+    #   step A: check the hourly table and write all tables to "<name>_new"
+    #   step B: replace them all at once; if one fails, all get their old rows back.
+    # The hourly table replaces only the years we ran,
+    # the station tables are small and always made from all years.
+    run_checks(silver, [not_empty, has_columns(*contract.KEY, *contract.MEASUREMENTS)])
+    save_to_staging(spark, silver, "silver.inmet_hourly")
+    stage_stations(spark, run_id)
+
+    tables = {"silver.inmet_hourly": years}
+    for name in STATION_TABLES:
+        tables[name] = None
+    move_all_from_staging(spark, tables)
+
+
 def print_summary(spark):
     # Print a short report in the log: rows per year and a few example rows.
     result = spark.table("silver.inmet_hourly")
@@ -200,17 +217,14 @@ def main():
 
     spark = start_spark("inmet-silver", lake, memory="2g")   # the VM has only 8 GB
     try:
+        # stop if Bronze was only half replaced (a killed Bronze run)
+        check_tables_match(spark)
+
         run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         silver = run_silver(spark, args.years, run_id)
-
-        # check the table, then save it (only the years we ran are replaced)
-        run_checks(silver, [not_empty, has_columns(*contract.KEY, *contract.MEASUREMENTS)])
-        save_table(spark, silver, "silver.inmet_hourly", args.years)
-        print("SILVER: saved the Spark table silver.inmet_hourly")
+        save_silver(spark, silver, args.years, run_id)
+        print("SILVER: saved silver.inmet_hourly, silver.station_history, silver.station")
         print_summary(spark)
-
-        # the station tables are small, so they are always made from all years
-        build_stations(spark, run_id)
         return 0
     except Exception as error:
         print("SILVER FAILED:", error)

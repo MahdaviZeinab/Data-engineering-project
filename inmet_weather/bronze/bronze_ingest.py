@@ -324,16 +324,17 @@ def check_new_tables(spark, years):
                          "nothing was replaced")
 
 
-def check_tables_match(spark, years):
-    # Check that the three tables hold the SAME run for every year.
+def check_tables_match(spark, years=None):
+    # Check that the three tables hold the SAME run for every year
+    # (years=None: check all years).
     # This can only go wrong if the job was killed in the middle of step B
-    # (e.g. the VM restarted). Silver can call this before it reads Bronze.
+    # (e.g. the VM restarted). Silver calls this before it reads Bronze.
     # Fix: run Bronze again for the years in the message.
     run_ids = None
     for name in ["inmet_hourly", "inmet_quarantine", "inmet_files"]:
-        ids = (spark.table(f"{DATABASE}.{name}")
-               .where(F.col("source_year").isin(years))
-               .select("source_year", "_bronze_run_id"))
+        ids = spark.table(f"{DATABASE}.{name}").select("source_year", "_bronze_run_id")
+        if years:
+            ids = ids.where(F.col("source_year").isin(years))
         run_ids = ids if run_ids is None else run_ids.union(ids)
     mixed = (run_ids.groupBy("source_year")
              .agg(F.countDistinct("_bronze_run_id").alias("runs"))

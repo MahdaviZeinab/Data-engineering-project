@@ -95,15 +95,19 @@ def move_all_from_staging(spark, names, years=None):
     #   2. move the new rows into every table
     #   3. if one move fails, put the old rows back in ALL tables
     #   4. only when all moves worked, delete the copies
-    for name in names:
-        make_backup(spark, name, years)
+    # names can also be a dict {table: years} when the tables replace
+    # different years, e.g. {"silver.inmet_hourly": [2025], "silver.station": None}.
+    if not isinstance(names, dict):
+        names = {name: years for name in names}
+    for name, table_years in names.items():
+        make_backup(spark, name, table_years)
     try:
-        for name in names:
-            move_from_staging(spark, name, years)
+        for name, table_years in names.items():
+            move_from_staging(spark, name, table_years)
     except Exception:
-        print("SAVE FAILED: putting the old rows back in", names)
-        for name in names:
-            restore_backup(spark, name, years)
+        print("SAVE FAILED: putting the old rows back in", list(names))
+        for name, table_years in names.items():
+            restore_backup(spark, name, table_years)
         raise
     for name in names:
         spark.sql(f"DROP TABLE IF EXISTS {name}_old")
