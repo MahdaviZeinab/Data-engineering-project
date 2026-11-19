@@ -30,7 +30,7 @@ from pathlib import Path
 
 from pyspark.sql import functions as F
 
-from common.spark import move_from_staging, save_to_staging, start_spark
+from common.spark import move_all_from_staging, save_to_staging, start_spark
 
 
 # ---------------------------------------------------------------------------
@@ -157,8 +157,12 @@ def only_data_lines(lines):
 def has_19_values(line):
     # True for a good data line. INMET ends every line with ";",
     # so a good line gives 19 values, or 20 when we count the empty one at the end.
+    # 20 values are only OK when the line ends with ";" (the 20th is empty).
+    # If the 20th has a real value, the line goes to quarantine,
+    # so we never drop a value without seeing it.
     number_of_values = F.size(F.split(line, ";"))
-    return number_of_values.isin(19, 20)
+    ends_with_semicolon = F.col(line).endswith(";")
+    return (number_of_values == 19) | ((number_of_values == 20) & ends_with_semicolon)
 
 
 def find_problems(lines):
@@ -294,8 +298,9 @@ def run_bronze(spark, source, years=None, run_id=None):
     check_new_tables(spark, years)
 
     # Step B: everything is fine, so now replace the years in the real tables.
-    for name in tables:
-        move_from_staging(spark, name, years)
+    # All three change together: if one fails, the old rows go back in all three.
+    move_all_from_staging(spark, list(tables), years)
+    check_tables_match(spark, years)
 
     save_run_report(spark, run_id, load_time, years)
     print_summary(spark, years)
@@ -317,6 +322,26 @@ def check_new_tables(spark, years):
     if lines_in_files != lines_saved:
         raise ValueError(f"expected {lines_in_files} lines but saved {lines_saved}; "
                          "nothing was replaced")
+
+
+def check_tables_match(spark, years):
+    # Check that the three tables hold the SAME run for every year.
+    # This can only go wrong if the job was killed in the middle of step B
+    # (e.g. the VM restarted). Silver can call this before it reads Bronze.
+    # Fix: run Bronze again for the years in the message.
+    run_ids = None
+    for name in ["inmet_hourly", "inmet_quarantine", "inmet_files"]:
+        ids = (spark.table(f"{DATABASE}.{name}")
+               .where(F.col("source_year").isin(years))
+               .select("source_year", "_bronze_run_id"))
+        run_ids = ids if run_ids is None else run_ids.union(ids)
+    mixed = (run_ids.groupBy("source_year")
+             .agg(F.countDistinct("_bronze_run_id").alias("runs"))
+             .where(F.col("runs") > 1).collect())
+    if mixed:
+        bad_years = sorted(r["source_year"] for r in mixed)
+        raise ValueError(f"Bronze tables hold different runs for {bad_years}; "
+                         "run Bronze again for these years")
 
 
 def save_run_report(spark, run_id, load_time, years):

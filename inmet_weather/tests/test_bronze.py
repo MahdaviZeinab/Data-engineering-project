@@ -6,8 +6,10 @@ from datetime import date, timedelta
 
 import pytest
 from pyspark.sql import SparkSession
+from pyspark.sql import functions as F
 
-from bronze.bronze_ingest import EXPECTED_HEADER, run_bronze
+from bronze.bronze_ingest import EXPECTED_HEADER, check_tables_match, run_bronze
+from common.spark import save_table
 
 HOURLY = "bronze.inmet_hourly"
 FILES = "bronze.inmet_files"
@@ -187,3 +189,53 @@ def test_year_without_files_stops_and_keeps_the_old_data(spark, source, tmp_path
         run_bronze(spark, source, years=[2021, 2022], run_id="bad")
     ids = [r[0] for r in spark.table(HOURLY).select("_bronze_run_id").distinct().collect()]
     assert ids == ["good"]
+
+
+def test_crash_while_replacing_puts_the_old_data_back(spark, source, monkeypatch):
+    run_bronze(spark, source, run_id="good")
+    count = spark.table(HOURLY).count()
+
+    # pretend the job crashes in step B, AFTER the hourly table was already replaced
+    import common.spark as common_spark
+    real = common_spark.move_from_staging
+
+    def crash(spark, name, years=None):
+        if name == QUARANTINE:
+            raise RuntimeError("simulated crash")
+        real(spark, name, years)
+
+    monkeypatch.setattr(common_spark, "move_from_staging", crash)
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        run_bronze(spark, source, years=[2020], run_id="bad")
+
+    # all three tables have the "good" run again, and no year was lost
+    for table in [HOURLY, FILES, QUARANTINE]:
+        ids = [r[0] for r in spark.table(table).select("_bronze_run_id").distinct().collect()]
+        assert ids == ["good"], table
+    assert spark.table(HOURLY).count() == count
+
+
+def test_tables_with_different_runs_are_found(spark, source):
+    run_bronze(spark, source, run_id="good")
+    check_tables_match(spark, [2020, 2021])                 # all fine
+
+    # pretend a killed job replaced 2020 only in the hourly table
+    other = spark.table(HOURLY).where("source_year = 2020") \
+                 .withColumn("_bronze_run_id", F.lit("other")).localCheckpoint()
+    save_table(spark, other, HOURLY, years=[2020])
+    with pytest.raises(ValueError, match=r"\[2020\]"):
+        check_tables_match(spark, [2020, 2021])
+
+
+def test_20th_value_must_be_empty(spark, tmp_path):
+    raw = tmp_path / "raw"
+    good = hours(1)                                      # ends with ";" -> 20th is empty
+    extra = good[1] + "99"                               # 20th value is "99"
+    no_end = good[2][:-1]                                # 19 values, no ";" at the end
+    write(raw / "2020", "INMET_SE_SP_A001_SÃO PAULO_01-01-2020_A_01-01-2020.CSV",
+          station("A001", "SÃO PAULO") + [EXPECTED_HEADER + ";", good[0], extra, no_end])
+    run_bronze(spark, str(raw))
+
+    assert spark.table(HOURLY).count() == 2               # good[0] and no_end
+    bad = spark.table(QUARANTINE).collect()
+    assert [(r["raw_line"], r["problem"]) for r in bad] == [(extra, "wrong number of values")]
