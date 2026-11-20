@@ -9,9 +9,11 @@ Steps:
   5. remove double rows (same station and same hour)
   6. impossible values -> empty, rare values -> flag (see value_rules.py)
   7. put rows we can not use aside, with a reason (see quarantine.py)
-  8. make the station tables (see stations.py)
-  9. save all four Silver tables together (if one fails, none is changed)
- 10. write a small run summary (counts) to <lake>/_runs/silver_<run_id>.json
+  8. add state, region and station name to every good row
+  9. check that no row is lost, and make the quality report (see quality.py)
+ 10. make the station tables (see stations.py)
+ 11. save all Silver tables together (if one fails, none is changed)
+ 12. write a small run summary (counts) to <lake>/_runs/silver_<run_id>.json
 
 All rules (names, missing codes, time zones ...) are in silver/contract.py.
 
@@ -35,8 +37,10 @@ from common.checks import has_columns, not_empty, run_checks
 from bronze.bronze_ingest import check_tables_match
 from common.spark import move_all_from_staging, save_to_staging, start_spark
 from silver import contract
+from silver.quality import check_silver, checksum, quality_report, reconcile, rows_per_year
 from silver.quarantine import count_reasons, quarantine_rows
-from silver.stations import STATION_TABLES, stage_stations, station_timezones
+from silver.stations import (STATION_TABLES, keep_one_file_per_year, stage_stations,
+                             station_timezones)
 from silver.value_rules import apply_value_rules, count_flags
 
 
@@ -123,12 +127,6 @@ def make_time(df, files):
 # ---------------------------------------------------------------------------
 # Step 5: double rows
 # ---------------------------------------------------------------------------
-def count_duplicates(df):
-    # Count the extra rows: rows with the same station and hour as another row.
-    rows = df.where(F.col("observed_at_utc").isNotNull()).select(contract.KEY)
-    return rows.count() - rows.distinct().count()
-
-
 def count_conflicts(df):
     # Count the station-hours that are in Bronze more than once WITH DIFFERENT values
     # (a real conflict: two files say different things about the same hour).
@@ -167,11 +165,17 @@ def remove_duplicates(df):
 
 
 # ---------------------------------------------------------------------------
-# Next steps (empty for now, filled in by the next issues)
+# Step 8: station details
 # ---------------------------------------------------------------------------
 def add_station(df, files):
-    # TODO Silver 10: add state, region and station name from the station tables.
-    return df
+    # Add state, region and station name. An hour from 2021 gets the details
+    # from the 2021 file (as the station was then), so we join on station + year.
+    stations = keep_one_file_per_year(files).select(
+        "station_code", "source_year",
+        F.upper(F.trim("state")).alias("state"),
+        F.upper(F.trim("region")).alias("region"),
+        F.trim("station_name").alias("station_name"))
+    return df.join(F.broadcast(stations), ["station_code", "source_year"], "left")
 
 
 # ---------------------------------------------------------------------------
@@ -179,23 +183,26 @@ def add_station(df, files):
 # ---------------------------------------------------------------------------
 def run_silver(spark, years=None, run_id=None, summary=None):
     # Do all the cleaning steps, one after the other.
-    # Returns two tables: (good rows, quarantined rows).
+    # Returns three tables: (good rows, quarantined rows, quality report).
     # If you give a dict as "summary", the counts of this run are put in it.
     run_id = run_id or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     summary = {} if summary is None else summary
     hourly, files = read_bronze(spark, years)
 
     df = check_schema(hourly)
-    summary["bronze_rows"] = df.count()
+    rows_in = rows_per_year(df)
+    summary["bronze_rows"] = sum(rows_in.values())
     summary["not_numeric_values"] = count_not_numeric(df)
     print("SILVER: values that are not numbers:", summary["not_numeric_values"])
     df = cast_values(df)
     df = make_time(df, files)
-    summary["duplicates_removed"] = count_duplicates(df)
     summary["duplicate_conflicts"] = count_conflicts(df)
+    df = remove_duplicates(df)
+    rows_left = rows_per_year(df)
+    duplicates = {year: rows - rows_left.get(year, 0) for year, rows in rows_in.items()}
+    summary["duplicates_removed"] = sum(duplicates.values())
     print("SILVER: double rows removed:", summary["duplicates_removed"],
           "| with different values:", summary["duplicate_conflicts"])
-    df = remove_duplicates(df)
     df = apply_value_rules(df)
     print("SILVER: flagged values per year:")
     count_flags(df).show(200, truncate=False)
@@ -205,10 +212,23 @@ def run_silver(spark, years=None, run_id=None, summary=None):
     good = add_station(good, files)
 
     run = F.lit(run_id)
-    return good.withColumn("_silver_run_id", run), quarantined.withColumn("_silver_run_id", run)
+    good = good.withColumn("_silver_run_id", run)
+    quarantined = quarantined.withColumn("_silver_run_id", run)
+
+    # Silver 10: no row is lost, the rules hold, and a checksum to compare reruns.
+    # If a check fails, the job stops here, so nothing is saved.
+    counts = reconcile(rows_in, rows_per_year(good), rows_per_year(quarantined), duplicates)
+    check_silver(good)
+    summary["reconcile"] = counts
+    summary["checksum"] = checksum(good)
+    print("SILVER: reconcile ok:", counts, "| checksum:", summary["checksum"])
+
+    # Silver 11: the "before -> after" numbers per year
+    report = quality_report(hourly, good, counts).withColumn("_silver_run_id", run)
+    return good, quarantined, report
 
 
-def save_silver(spark, silver, years, run_id, quarantined=None):
+def save_silver(spark, silver, years, run_id, quarantined=None, report=None):
     # Save all Silver tables TOGETHER, like Bronze does:
     #   step A: check the hourly table and write all tables to "<name>_new"
     #   step B: replace them all at once; if one fails, all get their old rows back.
@@ -222,6 +242,9 @@ def save_silver(spark, silver, years, run_id, quarantined=None):
     if quarantined is not None:                 # Silver 9: the rows we put aside
         save_to_staging(spark, quarantined, "silver.inmet_quarantine")
         tables["silver.inmet_quarantine"] = years
+    if report is not None:                      # Silver 11: the quality report
+        save_to_staging(spark, report, "silver.quality_report")
+        tables["silver.quality_report"] = years
     for name in STATION_TABLES:
         tables[name] = None
     move_all_from_staging(spark, tables)
@@ -284,10 +307,11 @@ def main():
 
         run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         summary = {}
-        silver, quarantined = run_silver(spark, args.years, run_id, summary)
-        save_silver(spark, silver, args.years, run_id, quarantined)
+        silver, quarantined, report = run_silver(spark, args.years, run_id, summary)
+        save_silver(spark, silver, args.years, run_id, quarantined, report)
         print("SILVER: saved silver.inmet_hourly, silver.inmet_quarantine, "
-              "silver.station_history, silver.station")
+              "silver.quality_report, silver.station_history, silver.station")
+        spark.table("silver.quality_report").show(truncate=False)
         write_run_summary(lake, run_id, args.years, summary, spark)
         print_summary(spark)
         return 0

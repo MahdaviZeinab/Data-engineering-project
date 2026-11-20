@@ -1,7 +1,9 @@
 # Silver layer
 
 Reads the Spark tables `bronze.inmet_hourly` and `bronze.inmet_files` (with `spark.table`) and saves
-the Spark tables `silver.inmet_hourly`, `silver.station_history` and `silver.station` (with `saveAsTable`).
+the Spark tables `silver.inmet_hourly`, `silver.inmet_quarantine`, `silver.quality_report`,
+`silver.station_history` and `silver.station` (with `saveAsTable`).
+The full story, with numbers, is in [`SILVER_REPORT.md`](SILVER_REPORT.md).
 One row in `silver.inmet_hourly` = one station, one hour.
 
 All rules live in [`contract.py`](contract.py). The job reads them from there, so this README and the code agree.

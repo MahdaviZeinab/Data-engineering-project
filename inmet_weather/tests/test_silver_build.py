@@ -6,9 +6,8 @@ from pyspark.sql import functions as F
 from silver.contract import BRONZE_COLUMNS, MEASUREMENTS
 import json
 
-from silver.silver_build import (cast_values, count_conflicts, count_duplicates,
-                                 count_not_numeric, make_time, remove_duplicates, run_silver,
-                                 write_run_summary)
+from silver.silver_build import (cast_values, count_conflicts, count_not_numeric, make_time,
+                                 remove_duplicates, run_silver, write_run_summary)
 
 TEMP = "temperatura_ar_c"   # becomes temp_c
 
@@ -25,6 +24,10 @@ def spark(tmp_path_factory):
     s.stop()
 
 
+FILE = {"state": "SP", "region": "SE", "station_name": "SAO PAULO",
+        "latitude": "-23,5", "longitude": "-46,6", "end_date": "2021-12-31", "source_file": "f.csv"}
+
+
 def fake_bronze(spark, columns):
     """Save 2 hourly rows (2020 and 2021) and 1 file row as Bronze Spark tables, all as text."""
     spark.sql("DROP DATABASE IF EXISTS bronze CASCADE")
@@ -32,15 +35,29 @@ def fake_bronze(spark, columns):
     rows = [{c: "1" for c in columns} | {"source_year": y} for y in (2020, 2021)]
     hourly = spark.createDataFrame(rows)
     hourly.write.partitionBy("source_year").saveAsTable("bronze.inmet_hourly")
-    spark.createDataFrame([{"station_code": "1", "state": "SP", "source_year": 2020,
-                            "latitude": "-23,5", "longitude": "-46,6"}]) \
+    spark.createDataFrame([FILE | {"station_code": "1", "source_year": 2020}]) \
+         .write.partitionBy("source_year").saveAsTable("bronze.inmet_files")
+
+
+def good_bronze(spark):
+    """Save 3 good Bronze rows for station A001 in 2021: 2 hours, one hour twice."""
+    spark.sql("DROP DATABASE IF EXISTS bronze CASCADE")
+    spark.sql("CREATE DATABASE bronze")
+    base = {c: "20,5" for c in BRONZE_COLUMNS} | {
+        "station_code": "A001", "data": "2021/01/01", "source_file": "f.csv",
+        "source_line_number": "1", "_bronze_ingestion_time": "t1", "source_year": 2021}
+    rows = [base | {"hora_utc": "0100 UTC"},
+            base | {"hora_utc": "0100 UTC", "source_line_number": "2"},    # the same hour again
+            base | {"hora_utc": "0200 UTC", "source_line_number": "3"}]
+    spark.createDataFrame(rows).write.partitionBy("source_year").saveAsTable("bronze.inmet_hourly")
+    spark.createDataFrame([FILE | {"station_code": "A001", "source_year": 2021}]) \
          .write.partitionBy("source_year").saveAsTable("bronze.inmet_files")
 
 
 def test_runs_and_adds_run_id(spark):
     fake_bronze(spark, BRONZE_COLUMNS)
     # the fake rows have date "1" and hour "1", so both go to quarantine (bad_timestamp)
-    good, quarantined = run_silver(spark, run_id="test")
+    good, quarantined, report = run_silver(spark, run_id="test")
     assert good.count() == 0
     assert [r["dq_issue"] for r in quarantined.collect()] == ["bad_timestamp"] * 2
     assert quarantined.first()["_silver_run_id"] == "test"
@@ -48,8 +65,36 @@ def test_runs_and_adds_run_id(spark):
 
 def test_years_option(spark):
     fake_bronze(spark, BRONZE_COLUMNS)
-    good, quarantined = run_silver(spark, years=[2021])
+    good, quarantined, report = run_silver(spark, years=[2021])
     assert good.count() + quarantined.count() == 1
+
+
+# ---------------------------------------------------------------- Silver 10 and 11: whole run
+def test_good_rows_get_station_details(spark):
+    good_bronze(spark)
+    good, quarantined, report = run_silver(spark, run_id="r1")
+    rows = good.collect()
+    assert len(rows) == 2                                  # the double hour is removed
+    assert {(r.state, r.region, r.station_name) for r in rows} == {("SP", "SE", "SAO PAULO")}
+
+
+def test_rerun_gives_the_same_checksum(spark):
+    good_bronze(spark)
+    first, second = {}, {}
+    run_silver(spark, run_id="run1", summary=first)
+    run_silver(spark, run_id="run2", summary=second)        # other run id, same data
+    assert first["checksum"] == second["checksum"]
+    assert first["reconcile"] == {2021: {"rows_in": 3, "rows_out": 2,
+                                         "rows_quarantined": 0, "duplicates_removed": 1}}
+
+
+def test_quality_report_numbers(spark):
+    good_bronze(spark)
+    good, quarantined, report = run_silver(spark, run_id="r1")
+    row = report.first().asDict()
+    assert (row["source_year"], row["rows_in"], row["duplicates_removed"],
+            row["rows_quarantined"], row["rows_out"]) == (2021, 3, 1, 0, 2)
+    assert row["missing_values_in"] == 0
 
 
 def test_stops_on_wrong_schema(spark):
@@ -164,13 +209,6 @@ def test_rows_without_time_are_kept(spark):
     assert df.count() == 2              # Silver 9 deals with them
 
 
-def test_count_duplicates(spark):
-    df = dup_rows(spark, [("A1", H, 2021, 25.0, "t1"),
-                          ("A1", H, 2021, 25.0, "t1"),
-                          ("A1", H, 2021, 25.0, "t1"),
-                          ("B1", H, 2021, 25.0, "t1"),
-                          ("A1", None, 2021, 25.0, "t1")])
-    assert count_duplicates(df) == 2    # 3 rows of A1 at 05:00 -> 2 extra
 
 
 def test_same_rows_keep_first_line_every_time(spark):
