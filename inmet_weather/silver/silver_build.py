@@ -7,8 +7,9 @@ Steps:
   3. turn the text values into numbers ("25,5" -> 25.5, "-9999" -> empty)
   4. make the time: UTC time and the station's local time
   5. remove double rows (same station and same hour)
-  6. save the result as the Spark table silver.inmet_hourly
-  7. make the station tables (see stations.py)
+  6. impossible values -> empty, rare values -> flag (see value_rules.py)
+  7. save the result as the Spark table silver.inmet_hourly
+  8. make the station tables (see stations.py)
 
 All rules (names, missing codes, time zones ...) are in silver/contract.py.
 
@@ -31,6 +32,7 @@ from common.checks import has_columns, not_empty, run_checks
 from common.spark import save_table, start_spark
 from silver import contract
 from silver.stations import build_stations, station_timezones
+from silver.value_rules import apply_value_rules, count_flags
 
 
 # ---------------------------------------------------------------------------
@@ -140,13 +142,13 @@ def remove_duplicates(df):
 
 
 # ---------------------------------------------------------------------------
+# Step 6: bad and rare values -> see silver/value_rules.py (apply_value_rules)
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
 # Next steps (empty for now, filled in by the next issues)
 # ---------------------------------------------------------------------------
-def apply_value_rules(df):
-    # TODO Silver 8: impossible values -> empty, rare values -> flag (see contract.py).
-    return df
-
-
 def quarantine_rows(df):
     # TODO Silver 9: put rows we can not use aside, with a reason.
     return df
@@ -172,6 +174,8 @@ def run_silver(spark, years=None, run_id=None):
     print("SILVER: double rows removed:", count_duplicates(df))
     df = remove_duplicates(df)
     df = apply_value_rules(df)
+    print("SILVER: flagged values per year:")
+    count_flags(df).show(200, truncate=False)
     df = quarantine_rows(df)
     df = add_station(df, files)
     return df.withColumn("_silver_run_id", F.lit(run_id))
