@@ -70,6 +70,10 @@ All tables are Parquet, split by `source_year`. Loading one year again only repl
 Saving happens in two steps: first all new rows go to `<table>_new` tables and are checked,
 and only then do they replace the old years. If the job crashes or a check fails in step one,
 the old data is not touched.
+In step two the three tables change together: the old rows are first copied to `<table>_old`,
+and if replacing one table fails, the old rows are put back in all three.
+If the job is killed in the middle (e.g. the VM restarts), `check_tables_match` finds years where
+the tables hold different runs; then run Bronze again for those years.
 Column names are simple versions of the Portuguese names (Spark tables do not allow commas
 in column names); the values are not changed.
 

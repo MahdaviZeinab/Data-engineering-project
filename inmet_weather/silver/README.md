@@ -108,3 +108,8 @@ Bronze keeps them in the table `bronze.inmet_files` (one row per file = one stat
 
 The station tables are small, so they are always built from **all** years, also when the job runs with `--years`.
 They run at the end of `silver_build`, or alone with `python -m silver.stations`.
+
+Saving works like Bronze: all Silver tables are first written to `<table>_new`, then replaced together.
+If replacing one table fails, all of them get their old rows back.
+Before Silver reads Bronze, `check_tables_match` stops the job if the Bronze tables hold different runs
+(a killed Bronze run); then run Bronze again for those years.

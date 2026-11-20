@@ -3,8 +3,10 @@ import datetime as dt
 
 import pytest
 from pyspark.sql import SparkSession
+from pyspark.sql import functions as F
 
 from silver import contract
+from silver.silver_build import save_silver
 from silver.stations import build_stations, latest_station, station_history
 
 SCHEMA = ("source_file string, source_year int, station_code string, end_date date, "
@@ -149,3 +151,41 @@ def test_build_stations_saves_both_tables(spark):
     assert history.count() == 3
     assert station.count() == 2
     assert station.first()["_silver_run_id"] == "test"
+
+
+# ---------------------------------------------------------------- saving all Silver tables together
+def silver_hourly(spark, run_id, years):
+    """A tiny clean Silver hourly table: 1 row per year."""
+    rows = [("A001", f"{year}-01-01 00:00:00", year, run_id) for year in years]
+    df = spark.createDataFrame(rows, "station_code string, observed_at_utc string, "
+                                     "source_year int, _silver_run_id string")
+    for m in contract.MEASUREMENTS:
+        df = df.withColumn(m, F.lit(1.0))
+    return df
+
+
+def test_crash_while_saving_silver_keeps_all_old_tables(spark, monkeypatch):
+    spark.sql("DROP DATABASE IF EXISTS silver CASCADE")
+    spark.sql("CREATE DATABASE IF NOT EXISTS bronze")
+    files(spark, [("A001", 2020, {}), ("A001", 2021, {})]) \
+        .write.mode("overwrite").partitionBy("source_year").saveAsTable("bronze.inmet_files")
+    save_silver(spark, silver_hourly(spark, "good", [2020, 2021]), [2020, 2021], "good")
+
+    # pretend the job crashes AFTER silver.inmet_hourly was already replaced
+    import common.spark as common_spark
+    real = common_spark.move_from_staging
+
+    def crash(spark, name, years=None):
+        if name == "silver.station":
+            raise RuntimeError("simulated crash")
+        real(spark, name, years)
+
+    monkeypatch.setattr(common_spark, "move_from_staging", crash)
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        save_silver(spark, silver_hourly(spark, "bad", [2021]), [2021], "bad")
+
+    # all three Silver tables have the "good" run again, and no year was lost
+    for table in ["silver.inmet_hourly", "silver.station_history", "silver.station"]:
+        ids = [r[0] for r in spark.table(table).select("_silver_run_id").distinct().collect()]
+        assert ids == ["good"], table
+    assert spark.table("silver.inmet_hourly").count() == 2

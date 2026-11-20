@@ -41,19 +41,16 @@ def save_to_staging(spark, table, name):
     table.write.mode("overwrite").format("parquet").saveAsTable(f"{name}_new")
 
 
-def move_from_staging(spark, name, years=None):
-    # Step B of saving: put the rows from "<name>_new" into the real table,
-    # then delete "<name>_new".
+def put_rows_in_table(spark, name, rows_table, years=None):
+    # Put the rows of rows_table (e.g. "<name>_new") into the real table.
     # - Tables with a source_year column are split into one part per year.
     # - years=None: replace the whole table.
     # - years=[2025]: delete only the 2025 part and add the new 2025 rows,
     #   the other years are not touched.
     # Running the same job twice gives the same result (no double rows).
-    # - If the columns changed (for example a new column dq_flags), the old years
-    #   can't be kept next to the new ones, so the whole table is replaced.
-    new_rows = spark.table(f"{name}_new")
-    writer = new_rows.write.format("parquet")
-    if "source_year" in new_rows.columns:
+    rows = spark.table(rows_table)
+    writer = rows.write.format("parquet")
+    if "source_year" in rows.columns:
         writer = writer.partitionBy("source_year")
 
     exists = spark.catalog.tableExists(name)
@@ -68,7 +65,58 @@ def move_from_staging(spark, name, years=None):
         writer.mode("append").saveAsTable(name)
     else:
         writer.mode("overwrite").saveAsTable(name)
+
+
+def move_from_staging(spark, name, years=None):
+    # Step B of saving: put the rows from "<name>_new" into the real table,
+    # then delete "<name>_new".
+    put_rows_in_table(spark, name, f"{name}_new", years)
     spark.sql(f"DROP TABLE {name}_new")
+
+
+def make_backup(spark, name, years=None):
+    # Copy the rows we are about to replace to "<name>_old",
+    # so we can put them back if something goes wrong.
+    spark.sql(f"DROP TABLE IF EXISTS {name}_old")
+    if not spark.catalog.tableExists(name):
+        return                      # a new table: nothing to keep
+    old_rows = spark.table(name)
+    if years and "source_year" in old_rows.columns:
+        old_rows = old_rows.where(old_rows["source_year"].isin(years))
+    old_rows.write.mode("overwrite").format("parquet").saveAsTable(f"{name}_old")
+
+
+def restore_backup(spark, name, years=None):
+    # Put the old rows from "<name>_old" back into the real table.
+    if spark.catalog.tableExists(f"{name}_old"):
+        put_rows_in_table(spark, name, f"{name}_old", years)
+    else:
+        spark.sql(f"DROP TABLE IF EXISTS {name}")   # the table was new: remove it
+
+
+def move_all_from_staging(spark, names, years=None):
+    # Step B for SEVERAL tables that belong together (e.g. the 3 Bronze tables).
+    # All tables must change together, or none of them:
+    #   1. keep a copy of the old rows of every table ("<name>_old")
+    #   2. move the new rows into every table
+    #   3. if one move fails, put the old rows back in ALL tables
+    #   4. only when all moves worked, delete the copies
+    # names can also be a dict {table: years} when the tables replace
+    # different years, e.g. {"silver.inmet_hourly": [2025], "silver.station": None}.
+    if not isinstance(names, dict):
+        names = {name: years for name in names}
+    for name, table_years in names.items():
+        make_backup(spark, name, table_years)
+    try:
+        for name, table_years in names.items():
+            move_from_staging(spark, name, table_years)
+    except Exception:
+        print("SAVE FAILED: putting the old rows back in", list(names))
+        for name, table_years in names.items():
+            restore_backup(spark, name, table_years)
+        raise
+    for name in names:
+        spark.sql(f"DROP TABLE IF EXISTS {name}_old")
 
 
 def save_table(spark, table, name, years=None):
