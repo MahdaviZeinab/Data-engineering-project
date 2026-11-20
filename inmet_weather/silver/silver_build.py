@@ -8,11 +8,10 @@ Steps:
   4. make the time: UTC time and the station's local time
   5. remove double rows (same station and same hour)
   6. impossible values -> empty, rare values -> flag (see value_rules.py)
-  7. save the result as the Spark table silver.inmet_hourly
+  7. put rows we can not use aside, with a reason (see quarantine.py)
   8. make the station tables (see stations.py)
-  6. make the station tables (see stations.py)
-  7. save all three Silver tables together (if one fails, none is changed)
-  8. write a small run summary (counts) to <lake>/_runs/silver_<run_id>.json
+  9. save all four Silver tables together (if one fails, none is changed)
+ 10. write a small run summary (counts) to <lake>/_runs/silver_<run_id>.json
 
 All rules (names, missing codes, time zones ...) are in silver/contract.py.
 
@@ -36,9 +35,9 @@ from common.checks import has_columns, not_empty, run_checks
 from bronze.bronze_ingest import check_tables_match
 from common.spark import move_all_from_staging, save_to_staging, start_spark
 from silver import contract
-from silver.stations import build_stations, station_timezones
-from silver.value_rules import apply_value_rules, count_flags
+from silver.quarantine import count_reasons, quarantine_rows
 from silver.stations import STATION_TABLES, stage_stations, station_timezones
+from silver.value_rules import apply_value_rules, count_flags
 
 
 # ---------------------------------------------------------------------------
@@ -163,17 +162,13 @@ def remove_duplicates(df):
 
 # ---------------------------------------------------------------------------
 # Step 6: bad and rare values -> see silver/value_rules.py (apply_value_rules)
+# Step 7: rows we can not use -> see silver/quarantine.py (quarantine_rows)
 # ---------------------------------------------------------------------------
 
 
 # ---------------------------------------------------------------------------
 # Next steps (empty for now, filled in by the next issues)
 # ---------------------------------------------------------------------------
-def quarantine_rows(df):
-    # TODO Silver 9: put rows we can not use aside, with a reason.
-    return df
-
-
 def add_station(df, files):
     # TODO Silver 10: add state, region and station name from the station tables.
     return df
@@ -183,7 +178,8 @@ def add_station(df, files):
 # The whole Silver job
 # ---------------------------------------------------------------------------
 def run_silver(spark, years=None, run_id=None, summary=None):
-    # Do all the cleaning steps, one after the other, and return the clean table.
+    # Do all the cleaning steps, one after the other.
+    # Returns two tables: (good rows, quarantined rows).
     # If you give a dict as "summary", the counts of this run are put in it.
     run_id = run_id or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     summary = {} if summary is None else summary
@@ -203,13 +199,17 @@ def run_silver(spark, years=None, run_id=None, summary=None):
     df = apply_value_rules(df)
     print("SILVER: flagged values per year:")
     count_flags(df).show(200, truncate=False)
-    df = quarantine_rows(df)
-    df = add_station(df, files)
-    return df.withColumn("_silver_run_id", F.lit(run_id))
+    good, quarantined = quarantine_rows(df, files)
+    print("SILVER: quarantined rows per year and reason:")
+    count_reasons(quarantined).show(200, truncate=False)
+    good = add_station(good, files)
+
+    run = F.lit(run_id)
+    return good.withColumn("_silver_run_id", run), quarantined.withColumn("_silver_run_id", run)
 
 
-def save_silver(spark, silver, years, run_id):
-    # Save all three Silver tables TOGETHER, like Bronze does:
+def save_silver(spark, silver, years, run_id, quarantined=None):
+    # Save all Silver tables TOGETHER, like Bronze does:
     #   step A: check the hourly table and write all tables to "<name>_new"
     #   step B: replace them all at once; if one fails, all get their old rows back.
     # The hourly table replaces only the years we ran,
@@ -219,9 +219,20 @@ def save_silver(spark, silver, years, run_id):
     stage_stations(spark, run_id)
 
     tables = {"silver.inmet_hourly": years}
+    if quarantined is not None:                 # Silver 9: the rows we put aside
+        save_to_staging(spark, quarantined, "silver.inmet_quarantine")
+        tables["silver.inmet_quarantine"] = years
     for name in STATION_TABLES:
         tables[name] = None
     move_all_from_staging(spark, tables)
+
+
+def quarantined_per_reason(spark):
+    # {reason: number of rows} from silver.inmet_quarantine (empty if there is no table yet)
+    if not spark.catalog.tableExists("silver.inmet_quarantine"):
+        return {}
+    rows = spark.table("silver.inmet_quarantine").groupBy("dq_issue").count().collect()
+    return {r["dq_issue"]: r["count"] for r in rows}
 
 
 def write_run_summary(lake, run_id, years, summary, spark):
@@ -236,8 +247,7 @@ def write_run_summary(lake, run_id, years, summary, spark):
         **summary,
         "silver_rows_per_year": {str(r["source_year"]): r["count"]
                                  for r in result.groupBy("source_year").count().collect()},
-        "rows_per_dq_issue": {str(r["dq_issue"] or "ok"): r["count"]
-                              for r in result.groupBy("dq_issue").count().collect()},
+        "quarantined_per_reason": quarantined_per_reason(spark),
     }
     folder = Path(lake) / "_runs"
     folder.mkdir(parents=True, exist_ok=True)
@@ -252,9 +262,8 @@ def print_summary(spark):
     result = spark.table("silver.inmet_hourly")
     result.groupBy("source_year").count().orderBy("source_year").show()
     result.select("station_code", "observed_at_utc", "local_time", "timezone",
-                  "temp_c", "humidity_pct", "precip_mm", "dq_issue", "source_year") \
+                  "temp_c", "humidity_pct", "precip_mm", "dq_flags", "source_year") \
           .show(10, truncate=False)
-    result.groupBy("dq_issue").count().show()
 
 
 def main():
@@ -275,9 +284,10 @@ def main():
 
         run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         summary = {}
-        silver = run_silver(spark, args.years, run_id, summary)
-        save_silver(spark, silver, args.years, run_id)
-        print("SILVER: saved silver.inmet_hourly, silver.station_history, silver.station")
+        silver, quarantined = run_silver(spark, args.years, run_id, summary)
+        save_silver(spark, silver, args.years, run_id, quarantined)
+        print("SILVER: saved silver.inmet_hourly, silver.inmet_quarantine, "
+              "silver.station_history, silver.station")
         write_run_summary(lake, run_id, args.years, summary, spark)
         print_summary(spark)
         return 0

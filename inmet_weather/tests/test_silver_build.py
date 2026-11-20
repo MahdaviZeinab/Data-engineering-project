@@ -32,20 +32,24 @@ def fake_bronze(spark, columns):
     rows = [{c: "1" for c in columns} | {"source_year": y} for y in (2020, 2021)]
     hourly = spark.createDataFrame(rows)
     hourly.write.partitionBy("source_year").saveAsTable("bronze.inmet_hourly")
-    spark.createDataFrame([{"station_code": "1", "state": "SP", "source_year": 2020}]) \
+    spark.createDataFrame([{"station_code": "1", "state": "SP", "source_year": 2020,
+                            "latitude": "-23,5", "longitude": "-46,6"}]) \
          .write.partitionBy("source_year").saveAsTable("bronze.inmet_files")
 
 
 def test_runs_and_adds_run_id(spark):
     fake_bronze(spark, BRONZE_COLUMNS)
-    df = run_silver(spark, run_id="test")
-    assert df.count() == 2
-    assert df.first()["_silver_run_id"] == "test"
+    # the fake rows have date "1" and hour "1", so both go to quarantine (bad_timestamp)
+    good, quarantined = run_silver(spark, run_id="test")
+    assert good.count() == 0
+    assert [r["dq_issue"] for r in quarantined.collect()] == ["bad_timestamp"] * 2
+    assert quarantined.first()["_silver_run_id"] == "test"
 
 
 def test_years_option(spark):
     fake_bronze(spark, BRONZE_COLUMNS)
-    assert run_silver(spark, years=[2021]).count() == 1
+    good, quarantined = run_silver(spark, years=[2021])
+    assert good.count() + quarantined.count() == 1
 
 
 def test_stops_on_wrong_schema(spark):
@@ -200,12 +204,13 @@ def test_run_fills_summary(spark):
 
 def test_write_run_summary(spark, tmp_path):
     spark.sql("CREATE DATABASE IF NOT EXISTS silver")
-    spark.createDataFrame([(2021, None), (2021, "bad_timestamp")],
-                          "source_year int, dq_issue string") \
+    spark.createDataFrame([(2021,), (2021,)], "source_year int") \
          .write.mode("overwrite").saveAsTable("silver.inmet_hourly")
+    spark.createDataFrame([(2021, "bad_timestamp")], "source_year int, dq_issue string") \
+         .write.mode("overwrite").saveAsTable("silver.inmet_quarantine")
     path = write_run_summary(str(tmp_path), "r1", [2021], {"duplicates_removed": 3}, spark)
     saved = json.loads(path.read_text())
     assert path.name == "silver_r1.json"
     assert saved["duplicates_removed"] == 3
     assert saved["silver_rows_per_year"] == {"2021": 2}
-    assert saved["rows_per_dq_issue"] == {"ok": 1, "bad_timestamp": 1}
+    assert saved["quarantined_per_reason"] == {"bad_timestamp": 1}
