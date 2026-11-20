@@ -27,7 +27,8 @@ from pyspark.sql import functions as F
 from pyspark.sql.window import Window
 
 from common.checks import has_columns, not_empty, one_row_per, run_checks
-from common.spark import save_table, start_spark
+from bronze.bronze_ingest import check_tables_match
+from common.spark import move_all_from_staging, save_to_staging, start_spark
 from silver import contract
 
 
@@ -153,8 +154,12 @@ def latest_station(history):
 # ---------------------------------------------------------------------------
 # The whole station step
 # ---------------------------------------------------------------------------
-def build_stations(spark, run_id):
-    # Read Bronze, make the two station tables, check them and save them.
+STATION_TABLES = ["silver.station_history", "silver.station"]
+
+
+def stage_stations(spark, run_id):
+    # Read Bronze, make the two station tables, check them and write them
+    # to "<name>_new" (step A). The real tables are not touched yet.
     files = spark.table("bronze.inmet_files")      # all years, on purpose
     history = station_history(files).withColumn("_silver_run_id", F.lit(run_id)).cache()
     latest = latest_station(history)
@@ -165,11 +170,18 @@ def build_stations(spark, run_id):
     run_checks(latest, [not_empty,
                         has_columns("station_code", "last_year", "latitude", "longitude", "timezone"),
                         one_row_per("station_code")])
-    save_table(spark, history, "silver.station_history")      # the whole table is replaced
-    save_table(spark, latest, "silver.station")
+    save_to_staging(spark, history, "silver.station_history")
+    save_to_staging(spark, latest, "silver.station")
 
     print_station_summary(history, latest)
     history.unpersist()
+
+
+def build_stations(spark, run_id):
+    # Make the two station tables and replace BOTH together (step B),
+    # the whole tables are replaced.
+    stage_stations(spark, run_id)
+    move_all_from_staging(spark, STATION_TABLES)
 
 
 def print_station_summary(history, latest):
@@ -195,6 +207,7 @@ def main():
 
     spark = start_spark("inmet-silver-stations", lake, memory="2g")
     try:
+        check_tables_match(spark)          # Bronze must not be half replaced
         build_stations(spark, datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ"))
         return 0
     except Exception as error:
