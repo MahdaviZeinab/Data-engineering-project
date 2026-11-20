@@ -49,12 +49,20 @@ def move_from_staging(spark, name, years=None):
     # - years=[2025]: delete only the 2025 part and add the new 2025 rows,
     #   the other years are not touched.
     # Running the same job twice gives the same result (no double rows).
+    # - If the columns changed (for example a new column dq_flags), the old years
+    #   can't be kept next to the new ones, so the whole table is replaced.
     new_rows = spark.table(f"{name}_new")
     writer = new_rows.write.format("parquet")
     if "source_year" in new_rows.columns:
         writer = writer.partitionBy("source_year")
 
-    if years and spark.catalog.tableExists(name):
+    exists = spark.catalog.tableExists(name)
+    same_columns = exists and set(spark.table(name).columns) == set(new_rows.columns)
+    if years and exists and not same_columns:
+        print(f"NOTE: the columns of {name} changed, so the whole table is replaced. "
+              "Years you did not run are gone until you run all years again.")
+
+    if years and same_columns:
         for year in years:
             spark.sql(f"ALTER TABLE {name} DROP IF EXISTS PARTITION (source_year={year})")
         writer.mode("append").saveAsTable(name)
