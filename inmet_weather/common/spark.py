@@ -54,7 +54,7 @@ def put_rows_in_table(spark, name, rows_table, years=None):
         writer = writer.partitionBy("source_year")
 
     exists = spark.catalog.tableExists(name)
-    same_columns = exists and set(spark.table(name).columns) == set(new_rows.columns)
+    same_columns = exists and set(spark.table(name).columns) == set(rows.columns)
     if years and exists and not same_columns:
         print(f"NOTE: the columns of {name} changed, so the whole table is replaced. "
               "Years you did not run are gone until you run all years again.")
