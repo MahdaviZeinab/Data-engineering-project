@@ -81,6 +81,28 @@ jobs:
           DAT535_OUTPUT_DIR: ${{ env.DATA_ROOT }}/lake/${{ env.LAKE_ENV }}
         run: python -m bronze.bronze_ingest --source "$DATA_ROOT/raw" --env "$LAKE_ENV" --years $YEARS
 
+      - name: Land fire files (download + unzip INPE fire foci)
+        run: python bronze/injection.py --source fires --years $YEARS
+
+      - name: Bronze fire ingestion (Spark)
+        env:
+          DAT535_OUTPUT_DIR: ${{ env.DATA_ROOT }}/lake/${{ env.LAKE_ENV }}
+        run: python -m bronze.fire_ingest --source "$DATA_ROOT/raw/fires" --env "$LAKE_ENV" --years $YEARS
+
+      - name: Write Bronze summary
+        if: always()                # also when a Bronze step failed (then Silver is skipped)
+        run: |
+          echo "## Production pipeline run: Bronze" >> $GITHUB_STEP_SUMMARY
+          echo "| Key | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Run # | ${{ github.run_number }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Environment | $LAKE_ENV |" >> $GITHUB_STEP_SUMMARY
+          echo "| Years | $YEARS |" >> $GITHUB_STEP_SUMMARY
+          echo "| Branch | ${{ github.ref_name }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Commit | ${{ github.sha }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Triggered by | ${{ github.actor }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Result | ${{ job.status }} |" >> $GITHUB_STEP_SUMMARY
+
   silver:
     needs: bronze
     runs-on: [self-hosted, linux, openstack]
@@ -96,6 +118,11 @@ jobs:
         env:
           DAT535_OUTPUT_DIR: ${{ env.DATA_ROOT }}/lake/${{ env.LAKE_ENV }}
         run: $DATA_ROOT/venv/bin/python -m silver.silver_build --env "$LAKE_ENV" --years $YEARS
+
+      - name: Build fire Silver
+        env:
+          DAT535_OUTPUT_DIR: ${{ env.DATA_ROOT }}/lake/${{ env.LAKE_ENV }}
+        run: $DATA_ROOT/venv/bin/python -m silver.fire_build --env "$LAKE_ENV" --years $YEARS
 
       - name: Write run summary
         if: always()
