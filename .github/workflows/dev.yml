@@ -9,6 +9,10 @@
 #   - writes ONLY to /data/inmet/lake/dev (prod data is never touched)
 #   - no approval needed (GitHub Environment "dev" has no rules)
 #
+# TEMPORARY (branch 40-add-new-dataset only): this branch writes to its own lake
+# folder, LAKE_DIR, so it does not clash with the Silver schema of other branches.
+# Undo these changes before merging into main.
+#
 # Order: job "bronze" (tests -> download -> Bronze tables)
 #        -> job "silver" (Silver tables), only if Bronze worked.
 name: Dev Pipeline
@@ -27,6 +31,7 @@ env:
   DATA_ROOT: /data/inmet            # folder on the VM, survives between runs
   LAKE_ENV: dev
   YEARS: "2025"                     # small on purpose
+  LAKE_DIR: /data/inmet/lake/dev-40-add-new-dataset   # TEMPORARY: own lake for this branch
 
 jobs:
   bronze:
@@ -41,7 +46,7 @@ jobs:
 
       - name: Check tools and make the data folders on the VM
         run: |
-          if ! mkdir -p "$DATA_ROOT/raw" "$DATA_ROOT/lake/$LAKE_ENV"; then
+          if ! mkdir -p "$DATA_ROOT/raw" "$LAKE_DIR"; then    # TEMPORARY: LAKE_DIR
             echo "Cannot create $DATA_ROOT. Run once on the VM:"
             echo "  sudo mkdir -p $DATA_ROOT && sudo chown \$USER $DATA_ROOT"
             exit 1
@@ -72,7 +77,7 @@ jobs:
 
       - name: Bronze ingestion (Spark)
         env:
-          DAT535_OUTPUT_DIR: ${{ env.DATA_ROOT }}/lake/${{ env.LAKE_ENV }}
+          DAT535_OUTPUT_DIR: ${{ env.LAKE_DIR }}      # TEMPORARY
         run: python -m bronze.bronze_ingest --source "$DATA_ROOT/raw" --env "$LAKE_ENV" --years $YEARS
 
       - name: Land fire files (download + unzip INPE fire foci)
@@ -80,7 +85,7 @@ jobs:
 
       - name: Bronze fire ingestion (Spark)
         env:
-          DAT535_OUTPUT_DIR: ${{ env.DATA_ROOT }}/lake/${{ env.LAKE_ENV }}
+          DAT535_OUTPUT_DIR: ${{ env.LAKE_DIR }}      # TEMPORARY
         run: python -m bronze.fire_ingest --source "$DATA_ROOT/raw/fires" --env "$LAKE_ENV" --years $YEARS
 
       - name: Write Bronze summary
@@ -91,6 +96,7 @@ jobs:
           echo "|-----|-------|" >> $GITHUB_STEP_SUMMARY
           echo "| Run # | ${{ github.run_number }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Environment | $LAKE_ENV |" >> $GITHUB_STEP_SUMMARY
+          echo "| Lake | $LAKE_DIR |" >> $GITHUB_STEP_SUMMARY
           echo "| Years | $YEARS |" >> $GITHUB_STEP_SUMMARY
           echo "| Branch | ${{ github.ref_name }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Commit | ${{ github.sha }} |" >> $GITHUB_STEP_SUMMARY
@@ -110,12 +116,12 @@ jobs:
 
       - name: Build Silver
         env:
-          DAT535_OUTPUT_DIR: ${{ env.DATA_ROOT }}/lake/${{ env.LAKE_ENV }}
+          DAT535_OUTPUT_DIR: ${{ env.LAKE_DIR }}      # TEMPORARY
         run: $DATA_ROOT/venv/bin/python -m silver.silver_build --env "$LAKE_ENV" --years $YEARS
 
       - name: Build fire Silver
         env:
-          DAT535_OUTPUT_DIR: ${{ env.DATA_ROOT }}/lake/${{ env.LAKE_ENV }}
+          DAT535_OUTPUT_DIR: ${{ env.LAKE_DIR }}      # TEMPORARY
         run: $DATA_ROOT/venv/bin/python -m silver.fire_build --env "$LAKE_ENV" --years $YEARS
 
       - name: Write run summary
@@ -126,6 +132,7 @@ jobs:
           echo "|-----|-------|" >> $GITHUB_STEP_SUMMARY
           echo "| Run # | ${{ github.run_number }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Environment | $LAKE_ENV |" >> $GITHUB_STEP_SUMMARY
+          echo "| Lake | $LAKE_DIR |" >> $GITHUB_STEP_SUMMARY
           echo "| Years | $YEARS |" >> $GITHUB_STEP_SUMMARY
           echo "| Branch | ${{ github.ref_name }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Commit | ${{ github.sha }} |" >> $GITHUB_STEP_SUMMARY
