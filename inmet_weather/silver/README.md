@@ -1,7 +1,9 @@
 # Silver layer
 
 Reads the Spark tables `bronze.inmet_hourly` and `bronze.inmet_files` (with `spark.table`) and saves
-the Spark tables `silver.inmet_hourly`, `silver.station_history` and `silver.station` (with `saveAsTable`).
+the Spark tables `silver.inmet_hourly`, `silver.inmet_quarantine`, `silver.quality_report`,
+`silver.station_history` and `silver.station` (with `saveAsTable`).
+The full story, with numbers, is in [`SILVER_REPORT.md`](SILVER_REPORT.md).
 One row in `silver.inmet_hourly` = one station, one hour.
 
 All rules live in [`contract.py`](contract.py). The job reads them from there, so this README and the code agree.
@@ -75,6 +77,19 @@ These are start values. Update them with the S1 percentiles.
 **Code:** [`value_rules.py`](value_rules.py). Every row gets a list column `dq_flags`,
 for example `["invalid_humidity_pct", "unusual_precip_mm"]`. An empty value (missing) never gets a flag.
 `count_flags()` gives the number of flags per year; the Silver job prints it in the log.
+
+## Quarantine (Silver 9, [`quarantine.py`](quarantine.py)): rows we can not use
+
+Each row gets one reason in `dq_issue` (the first one that is true). Good rows go to
+`silver.inmet_hourly`, the others to `silver.inmet_quarantine`. Nothing is thrown away.
+
+| Reason | Why we can't use the row |
+|---|---|
+| `bad_timestamp` | wrong date or hour, so we don't know when it was measured |
+| `unknown_station` | station not in `bronze.inmet_files` (no name, state or place) |
+| `unknown_timezone` | no time zone for the station, so no local day |
+| `not_in_brazil` | outside Brazil (e.g. C891 in Antarctica): good data, but not for our question |
+| `all_values_empty` | all 17 measurements are empty (after Silver 8) |
 
 ## Time zones (`STATE_TIMEZONE`, `STATION_TIMEZONE_OVERRIDE`)
 

@@ -189,3 +189,17 @@ def test_crash_while_saving_silver_keeps_all_old_tables(spark, monkeypatch):
         ids = [r[0] for r in spark.table(table).select("_silver_run_id").distinct().collect()]
         assert ids == ["good"], table
     assert spark.table("silver.inmet_hourly").count() == 2
+
+
+def test_save_silver_also_saves_quarantine(spark):
+    # Silver 9: the quarantined rows are saved together with the other Silver tables
+    spark.sql("DROP DATABASE IF EXISTS silver CASCADE")
+    spark.sql("CREATE DATABASE IF NOT EXISTS bronze")
+    files(spark, [("A001", 2021, {})]) \
+        .write.mode("overwrite").partitionBy("source_year").saveAsTable("bronze.inmet_files")
+    quarantined = spark.createDataFrame([("A001", 2021, "bad_timestamp", "run1")],
+                                        "station_code string, source_year int, "
+                                        "dq_issue string, _silver_run_id string")
+    save_silver(spark, silver_hourly(spark, "run1", [2021]), [2021], "run1", quarantined)
+    reasons = [r.dq_issue for r in spark.table("silver.inmet_quarantine").collect()]
+    assert reasons == ["bad_timestamp"]
