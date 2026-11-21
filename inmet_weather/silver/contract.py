@@ -119,9 +119,10 @@ ALTITUDE_TOLERANCE_M = 1.0
 BRAZIL_BOX = {"lat": (-34.0, 5.5), "lon": (-74.5, -28.5)}
 
 
-def check_schema(columns):
+def check_schema(columns, expected=BRONZE_COLUMNS):
     # Stop the Silver job if Bronze has a missing or a new column.
-    missing = [c for c in BRONZE_COLUMNS if c not in columns]
-    new = [c for c in columns if c not in BRONZE_COLUMNS]
+    # The fire job uses it too, with expected=fire_contract.BRONZE_COLUMNS.
+    missing = [c for c in expected if c not in columns]
+    new = [c for c in columns if c not in expected]
     if missing or new:
         raise ValueError(f"Bronze schema changed. Missing: {missing}. New: {new}.")
