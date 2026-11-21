@@ -53,7 +53,13 @@ def put_rows_in_table(spark, name, rows_table, years=None):
     if "source_year" in rows.columns:
         writer = writer.partitionBy("source_year")
 
-    if years and spark.catalog.tableExists(name):
+    exists = spark.catalog.tableExists(name)
+    same_columns = exists and set(spark.table(name).columns) == set(rows.columns)
+    if years and exists and not same_columns:
+        print(f"NOTE: the columns of {name} changed, so the whole table is replaced. "
+              "Years you did not run are gone until you run all years again.")
+
+    if years and same_columns:
         for year in years:
             spark.sql(f"ALTER TABLE {name} DROP IF EXISTS PARTITION (source_year={year})")
         writer.mode("append").saveAsTable(name)

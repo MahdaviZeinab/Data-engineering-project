@@ -54,9 +54,9 @@ A missing or new column stops the job with a clear error.
 | `wind_dir_deg` < 0 or > 360 | compass direction |
 | `pressure_*` < 1 mB | pressure can't be 0 |
 | `radiation_kj_m2` > 5,000 | the sun gives about 4,900 kJ/m² per hour at most |
-| max < min (temp, dew point, pressure, humidity) | max can't be below min in the same hour |
+| max < min (temp, dew point, pressure, humidity) | max can't be below min in the same hour (we don't know which is wrong, so both become null) |
 | `dew_point_c` > `temp_c` + 0.5 | dew point can't be above air temperature (0.5 for sensor error) |
-| small negative radiation → 0 (counted) | sensor noise at night |
+| small negative radiation → 0 (flag `radiation_negative_set_to_0`) | sensor noise at night |
 
 Only that one value becomes null and gets `invalid_<column>` in `dq_flags`. The rest of the row stays.
 
@@ -71,6 +71,10 @@ Only that one value becomes null and gets `invalid_<column>` in `dq_flags`. The 
 | temperature change > 10 °C from the hour before | sudden jump, check it |
 
 These are start values. Update them with the S1 percentiles.
+
+**Code:** [`value_rules.py`](value_rules.py). Every row gets a list column `dq_flags`,
+for example `["invalid_humidity_pct", "unusual_precip_mm"]`. An empty value (missing) never gets a flag.
+`count_flags()` gives the number of flags per year; the Silver job prints it in the log.
 
 ## Time zones (`STATE_TIMEZONE`, `STATION_TIMEZONE_OVERRIDE`)
 
