@@ -94,11 +94,12 @@ def find_years(source):
     return sorted(years)
 
 
-def read_files(spark, source, years):
+def read_files(spark, source, years, encoding=ENCODING):
     # Read every CSV file of the chosen years. We get one row per file,
     # with the file name, the year and the whole text of the file.
     # We read the bytes ourselves so we can decode them as Latin-1;
     # then words like "PRECIPITAÇÃO" stay correct.
+    # The fire job uses it too, with encoding="UTF-8".
     folders = [f"{source}/{year}" for year in years]
     files = (spark.read.format("binaryFile")
              .option("pathGlobFilter", "*.[cC][sS][vV]")
@@ -110,7 +111,7 @@ def read_files(spark, source, years):
     return files.select(
         F.element_at(path_parts, -1).alias("source_file"),
         F.element_at(path_parts, -2).cast("int").alias("source_year"),
-        F.decode("content", ENCODING).alias("text"),
+        F.decode("content", encoding).alias("text"),
     )
 
 
@@ -247,11 +248,12 @@ def count_bad_lines(quarantine):
     return quarantine.groupBy("source_file").agg(F.count("*").alias("quarantined_lines"))
 
 
-def add_load_info(table, run_id, load_time):
+def add_load_info(table, run_id, load_time, source="inmet_portal"):
     # Add 4 columns that tell where and when this row was loaded.
     # This helps us later to find out which run made a row.
+    # The fire job uses it too, with source="inpe_queimadas".
     return (table
-            .withColumn("_bronze_source", F.lit("inmet_portal"))
+            .withColumn("_bronze_source", F.lit(source))
             .withColumn("_bronze_run_id", F.lit(run_id))
             .withColumn("_bronze_ingestion_time", F.lit(load_time).cast("timestamp"))
             .withColumn("_bronze_code_version", F.lit(git_version())))
@@ -324,14 +326,18 @@ def check_new_tables(spark, years):
                          "nothing was replaced")
 
 
-def check_tables_match(spark, years=None):
-    # Check that the three tables hold the SAME run for every year
+INMET_TABLES = ["inmet_hourly", "inmet_quarantine", "inmet_files"]
+
+
+def check_tables_match(spark, years=None, tables=INMET_TABLES):
+    # Check that the tables hold the SAME run for every year
     # (years=None: check all years).
     # This can only go wrong if the job was killed in the middle of step B
     # (e.g. the VM restarted). Silver calls this before it reads Bronze.
     # Fix: run Bronze again for the years in the message.
+    # The fire job uses it too, with its own two tables.
     run_ids = None
-    for name in ["inmet_hourly", "inmet_quarantine", "inmet_files"]:
+    for name in tables:
         ids = spark.table(f"{DATABASE}.{name}").select("source_year", "_bronze_run_id")
         if years:
             ids = ids.where(F.col("source_year").isin(years))

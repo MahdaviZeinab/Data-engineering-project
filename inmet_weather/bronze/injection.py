@@ -1,13 +1,16 @@
 """
-Step 0: download the INMET yearly zip files and unzip the CSV files.
+Step 0: download the yearly zip files and unzip the CSV files.
+Works for both sources: INMET weather (default) and INPE fires (--source fires).
 
   data/raw/<year>.zip     the original zip file (kept as it is)
   data/raw/<year>/*.CSV   the CSV files the Bronze job reads
   data/raw/<year>/_DONE   written last: it means the year is complete
+  (fires: the same, in data/raw/fires/)
 
 You can run it again at any time: finished years are skipped.
-  python bronze/injection.py                # 2020-2025
-  python bronze/injection.py --years 2025   # one year
+  python bronze/injection.py                              # INMET, 2020-2025
+  python bronze/injection.py --years 2025                 # INMET, one year
+  python bronze/injection.py --source fires --years 2025  # INPE fires, one year
 """
 import argparse
 import shutil
@@ -19,8 +22,17 @@ from pathlib import Path
 import requests
 from tqdm import tqdm
 
-URL = "https://portal.inmet.gov.br/uploads/dadoshistoricos/{year}.zip"
-FOLDER = Path(__file__).resolve().parents[1] / "data" / "raw"   # <project>/data/raw
+RAW = Path(__file__).resolve().parents[1] / "data" / "raw"      # <project>/data/raw
+
+# Our two sources. Both give one zip per year, so the same steps work for both.
+# The fire files get their own folder (raw/fires), so the INMET Bronze job,
+# which reads the year folders raw/<year>, never sees them.
+SOURCES = {
+    "inmet": ("https://portal.inmet.gov.br/uploads/dadoshistoricos/{year}.zip", RAW),
+    "fires": ("https://dataserver-coids.inpe.br/queimadas/queimadas/focos/csv/anual/"
+              "Brasil_sat_ref/focos_br_ref_{year}.zip", RAW / "fires"),
+}
+URL, FOLDER = SOURCES["inmet"]      # main() changes these when --source fires is given
 DONE = "_DONE"      # file we write last, when a year is complete
 TRIES = 3           # how many times we try to download a year
 
@@ -168,10 +180,14 @@ def land(year):
 
 
 def main():
-    # Read the years from the command line and get every year ready.
-    parser = argparse.ArgumentParser(description="Download and unzip the INMET files.")
+    # Read the source and the years from the command line and get every year ready.
+    global URL, FOLDER
+    parser = argparse.ArgumentParser(description="Download and unzip the INMET or INPE files.")
+    parser.add_argument("--source", default="inmet", choices=list(SOURCES))
     parser.add_argument("--years", type=int, nargs="*", default=list(range(2020, 2026)))
-    years = parser.parse_args().years
+    args = parser.parse_args()
+    URL, FOLDER = SOURCES[args.source]
+    years = args.years
     FOLDER.mkdir(parents=True, exist_ok=True)
     failed = [year for year in years if not land(year)]
     if failed:
