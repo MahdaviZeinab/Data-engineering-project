@@ -79,6 +79,7 @@ def spark(tmp_path_factory):
 
 @pytest.fixture(autouse=True)
 def empty_lake(spark):
+    spark.catalog.clearCache()                       # Silver caches tables; forget them before dropping
     spark.sql("DROP DATABASE IF EXISTS bronze CASCADE")
     spark.sql("DROP DATABASE IF EXISTS silver CASCADE")
 

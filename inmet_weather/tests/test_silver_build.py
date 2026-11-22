@@ -30,6 +30,7 @@ FILE = {"state": "SP", "region": "SE", "station_name": "SAO PAULO",
 
 def fake_bronze(spark, columns):
     """Save 2 hourly rows (2020 and 2021) and 1 file row as Bronze Spark tables, all as text."""
+    spark.catalog.clearCache()                       # Silver caches tables; forget them before dropping
     spark.sql("DROP DATABASE IF EXISTS bronze CASCADE")
     spark.sql("CREATE DATABASE bronze")
     rows = [{c: "1" for c in columns} | {"source_year": y} for y in (2020, 2021)]
@@ -41,6 +42,7 @@ def fake_bronze(spark, columns):
 
 def good_bronze(spark):
     """Save 3 good Bronze rows for station A001 in 2021: 2 hours, one hour twice."""
+    spark.catalog.clearCache()                       # Silver caches tables; forget them before dropping
     spark.sql("DROP DATABASE IF EXISTS bronze CASCADE")
     spark.sql("CREATE DATABASE bronze")
     base = {c: "20,5" for c in BRONZE_COLUMNS} | {

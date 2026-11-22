@@ -165,6 +165,7 @@ def silver_hourly(spark, run_id, years):
 
 
 def test_crash_while_saving_silver_keeps_all_old_tables(spark, monkeypatch):
+    spark.catalog.clearCache()                       # Silver caches tables; forget them before dropping
     spark.sql("DROP DATABASE IF EXISTS silver CASCADE")
     spark.sql("CREATE DATABASE IF NOT EXISTS bronze")
     files(spark, [("A001", 2020, {}), ("A001", 2021, {})]) \
@@ -193,6 +194,7 @@ def test_crash_while_saving_silver_keeps_all_old_tables(spark, monkeypatch):
 
 def test_save_silver_also_saves_quarantine(spark):
     # Silver 9: the quarantined rows are saved together with the other Silver tables
+    spark.catalog.clearCache()                       # Silver caches tables; forget them before dropping
     spark.sql("DROP DATABASE IF EXISTS silver CASCADE")
     spark.sql("CREATE DATABASE IF NOT EXISTS bronze")
     files(spark, [("A001", 2021, {})]) \

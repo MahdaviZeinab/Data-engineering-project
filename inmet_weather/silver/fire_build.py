@@ -136,10 +136,12 @@ def run_fire_silver(spark, years=None, run_id=None):
     run_id = run_id or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     df = cast_values(read_bronze(spark, years))
     df = add_state_and_time(spark, df)
-    df = mark_problems(df)
+    # cache(): Spark redoes every step for each count, check or save,
+    # so we keep the tables we use more than once (spark.stop() frees them).
+    df = mark_problems(df).cache()             # counted twice, then cleaned
     print("FIRE SILVER: double rows removed:", count_duplicates(df))
     df = remove_duplicates(df)
-    return df.withColumn("_silver_run_id", F.lit(run_id))
+    return df.withColumn("_silver_run_id", F.lit(run_id)).cache()   # checked, then saved
 
 
 def save_fire_silver(spark, silver, years=None):
