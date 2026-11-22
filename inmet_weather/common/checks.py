@@ -29,6 +29,16 @@ def one_row_per(*key):
     return check
 
 
+def no_nulls(*columns):
+    # Make a check that stops if one of these columns has an empty value.
+    def check(df):
+        for column in columns:
+            empty = df.where(f"{column} IS NULL").count()
+            if empty:
+                raise ValueError(f"{empty} rows with an empty {column}")
+    return check
+
+
 def run_checks(df, checks):
     # Run every check on the table, one after the other.
     for check in checks:

@@ -1,7 +1,9 @@
 # Silver layer
 
 Reads the Spark tables `bronze.inmet_hourly` and `bronze.inmet_files` (with `spark.table`) and saves
-the Spark tables `silver.inmet_hourly`, `silver.station_history` and `silver.station` (with `saveAsTable`).
+the Spark tables `silver.inmet_hourly`, `silver.inmet_quarantine`, `silver.quality_report`,
+`silver.station_history` and `silver.station` (with `saveAsTable`).
+The full story, with numbers, is in [`SILVER_REPORT.md`](SILVER_REPORT.md).
 One row in `silver.inmet_hourly` = one station, one hour.
 
 All rules live in [`contract.py`](contract.py). The job reads them from there, so this README and the code agree.
@@ -54,9 +56,9 @@ A missing or new column stops the job with a clear error.
 | `wind_dir_deg` < 0 or > 360 | compass direction |
 | `pressure_*` < 1 mB | pressure can't be 0 |
 | `radiation_kj_m2` > 5,000 | the sun gives about 4,900 kJ/m² per hour at most |
-| max < min (temp, dew point, pressure, humidity) | max can't be below min in the same hour |
+| max < min (temp, dew point, pressure, humidity) | max can't be below min in the same hour (we don't know which is wrong, so both become null) |
 | `dew_point_c` > `temp_c` + 0.5 | dew point can't be above air temperature (0.5 for sensor error) |
-| small negative radiation → 0 (counted) | sensor noise at night |
+| small negative radiation → 0 (flag `radiation_negative_set_to_0`) | sensor noise at night |
 
 Only that one value becomes null and gets `invalid_<column>` in `dq_flags`. The rest of the row stays.
 
@@ -71,6 +73,23 @@ Only that one value becomes null and gets `invalid_<column>` in `dq_flags`. The 
 | temperature change > 10 °C from the hour before | sudden jump, check it |
 
 These are start values. Update them with the S1 percentiles.
+
+**Code:** [`value_rules.py`](value_rules.py). Every row gets a list column `dq_flags`,
+for example `["invalid_humidity_pct", "unusual_precip_mm"]`. An empty value (missing) never gets a flag.
+`count_flags()` gives the number of flags per year; the Silver job prints it in the log.
+
+## Quarantine (Silver 9, [`quarantine.py`](quarantine.py)): rows we can not use
+
+Each row gets one reason in `dq_issue` (the first one that is true). Good rows go to
+`silver.inmet_hourly`, the others to `silver.inmet_quarantine`. Nothing is thrown away.
+
+| Reason | Why we can't use the row |
+|---|---|
+| `bad_timestamp` | wrong date or hour, so we don't know when it was measured |
+| `unknown_station` | station not in `bronze.inmet_files` (no name, state or place) |
+| `unknown_timezone` | no time zone for the station, so no local day |
+| `not_in_brazil` | outside Brazil (e.g. C891 in Antarctica): good data, but not for our question |
+| `all_values_empty` | all 17 measurements are empty (after Silver 8) |
 
 ## Time zones (`STATE_TIMEZONE`, `STATION_TIMEZONE_OVERRIDE`)
 
