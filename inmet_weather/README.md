@@ -5,11 +5,11 @@ Second source: fire foci from INPE (Queimadas), one CSV per year (2020: 222,797 
 Batch processing with Apache Spark and GitHub Actions.
 
 ```
-INMET website ─► bronze/injection.py ─► data/raw/<year>/*.CSV ─► bronze/bronze_ingest.py ─► Spark tables bronze.*
+INMET website ─► bronze/injection.py ─► data/raw/<year>/inmet/*.CSV ─► bronze/bronze_ingest.py ─► Spark tables bronze.*
                                                      silver/ reads spark.table("bronze.inmet_hourly") ─► Spark tables silver.*
                                                      gold/   (later)
 
-INPE website  ─► bronze/injection.py --source fires ─► data/raw/fires/<year>/*.csv ─► bronze/fire_ingest.py ─► bronze.fire_*
+INPE website  ─► bronze/injection.py --source fire ─► data/raw/<year>/fire/*.csv ─► bronze/fire_ingest.py ─► bronze.fire_*
                                                      silver/fire_build.py reads bronze.fire_foci ─► silver.fire_foci
 ```
 
@@ -22,7 +22,7 @@ Every layer starts Spark and saves its tables with `common/spark.py`, so they al
 ```
 inmet_weather/
 ├── bronze/                 Bronze layer: getting the data in
-│   ├── injection.py        download + unzip the yearly files (INMET, or INPE with --source fires)
+│   ├── injection.py        download + unzip the yearly files (INMET, or INPE with --source fire)
 │   ├── bronze_ingest.py    Spark job: raw files -> Bronze Spark tables
 │   └── fire_ingest.py      Spark job: fire files -> bronze.fire_* tables (same strategy as INMET)
 ├── common/
@@ -32,8 +32,9 @@ inmet_weather/
 ├── gold/                   Gold layer (later)
 ├── tests/                  tests for all layers
 ├── data/                   NOT in Git (see .gitignore)
-│   ├── raw/<year>/         the original INMET CSV files
-│   ├── raw/fires/<year>/   the original INPE fire CSV file
+│   ├── raw/<year>.zip      the original INMET zip   (raw/fire_<year>.zip: the INPE fire zip)
+│   ├── raw/<year>/inmet/   the original INMET CSV files
+│   ├── raw/<year>/fire/    the original INPE fire CSV file
 │   └── lake/<env>/         the output: warehouse/ (Spark tables) + metastore_db/ (table list)
 ├── requirements.txt
 └── pytest.ini
@@ -58,7 +59,7 @@ python bronze/injection.py                    # download + unzip (skips finished
 python -m bronze.bronze_ingest                # Bronze, all years, dev
 python -m bronze.bronze_ingest --years 2025   # only 2025 (other years are not touched)
 python -m bronze.bronze_ingest --env prod     # production folder
-python bronze/injection.py --source fires     # fire files: download + unzip
+python bronze/injection.py --source fire      # fire files: download + unzip
 python -m bronze.fire_ingest                  # fire Bronze (same --years / --env options)
 python -m silver.fire_build                   # fire Silver
 python -m pytest -q                           # tests

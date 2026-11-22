@@ -35,27 +35,29 @@ def test_fire_schema_check():
 
 
 # ---------------------------------------------------------------------------
-# Download step: the same injection.py as INMET, with --source fires (no network)
+# Download step: the same injection.py as INMET, with --source fire (no network)
 # ---------------------------------------------------------------------------
 @pytest.fixture()
-def raw_fires(tmp_path, monkeypatch):
-    monkeypatch.setattr(injection, "FOLDER", tmp_path / "fires")
+def raw_fire(tmp_path, monkeypatch):
+    # The fake data/raw folder, with the source set to "fire".
+    monkeypatch.setattr(injection, "RAW", tmp_path)
+    monkeypatch.setattr(injection, "SOURCE", "fire")
     monkeypatch.setattr(injection, "download", lambda year: True)   # never go online
-    (tmp_path / "fires").mkdir()
-    return tmp_path / "fires"
+    return tmp_path
 
 
-def test_fire_source_has_its_own_folder():
-    url, folder = injection.SOURCES["fires"]
+def test_fire_url():
+    url = injection.SOURCES["fire"]
     assert url.format(year=2020).endswith("/focos_br_ref_2020.zip")
-    assert folder == injection.RAW / "fires"      # not a year folder, INMET never reads it
 
 
-def test_unzip_fire_zip_with_one_lowercase_csv(raw_fires):
-    with zipfile.ZipFile(raw_fires / "2020.zip", "w") as archive:
+def test_fire_files_go_next_to_the_inmet_files(raw_fire):
+    with zipfile.ZipFile(raw_fire / "fire_2020.zip", "w") as archive:
         archive.writestr("focos_br_ref_2020.csv", "a")
     assert injection.land(2020)
-    assert sorted(p.name for p in (raw_fires / "2020").iterdir()) == ["_DONE", "focos_br_ref_2020.csv"]
+    # data/raw/2020/fire/ has the CSV and _DONE; the zip stays in data/raw
+    assert sorted(p.name for p in (raw_fire / "2020" / "fire").iterdir()) == ["_DONE", "focos_br_ref_2020.csv"]
+    assert (raw_fire / "fire_2020.zip").exists()
     assert injection.is_unzipped(2020)
 
 
@@ -88,7 +90,7 @@ def line(foco_id, state="MATO GROSSO", lat="  -10.513000 ", time="2020-06-16 17:
 
 
 def write(source, year, lines, header=EXPECTED_HEADER):
-    folder = source / str(year)
+    folder = source / str(year) / "fire"           # data/raw/<year>/fire/
     folder.mkdir(parents=True, exist_ok=True)
     text = "\n".join([header] + lines) + "\n"
     (folder / f"focos_br_ref_{year}.csv").write_text(text, encoding="utf-8")
@@ -126,7 +128,7 @@ def test_bronze_wrong_header_goes_to_quarantine(spark, tmp_path):
 def test_bronze_missing_year_changes_nothing(spark, tmp_path):
     write(tmp_path, 2020, [line("a")])
     run_fire_bronze(spark, str(tmp_path), [2020])
-    (tmp_path / "2021").mkdir()                                      # a year without a file
+    (tmp_path / "2021" / "fire").mkdir(parents=True)                 # a year without a file
     with pytest.raises(Exception):
         run_fire_bronze(spark, str(tmp_path), [2020, 2021])
     assert [r["foco_id"] for r in spark.table(FOCI).collect()] == ["a"]   # old data is still there

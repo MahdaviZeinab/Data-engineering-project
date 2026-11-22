@@ -82,12 +82,12 @@ jobs:
         run: python -m bronze.bronze_ingest --source "$DATA_ROOT/raw" --env "$LAKE_ENV" --years $YEARS
 
       - name: Land fire files (download + unzip INPE fire foci)
-        run: python bronze/injection.py --source fires --years $YEARS
+        run: python bronze/injection.py --source fire --years $YEARS
 
       - name: Bronze fire ingestion (Spark)
         env:
           DAT535_OUTPUT_DIR: ${{ env.DATA_ROOT }}/lake/${{ env.LAKE_ENV }}
-        run: python -m bronze.fire_ingest --source "$DATA_ROOT/raw/fires" --env "$LAKE_ENV" --years $YEARS
+        run: python -m bronze.fire_ingest --source "$DATA_ROOT/raw" --env "$LAKE_ENV" --years $YEARS
 
       - name: Write Bronze summary
         if: always()                # also when a Bronze step failed (then Silver is skipped)

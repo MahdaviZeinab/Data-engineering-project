@@ -14,10 +14,11 @@ Tables (all in the Spark database "bronze", split by year):
   bronze.fire_quarantine   bad lines and the reason
   bronze.fire_runs         one row per run: when, which years, how many files and rows
 
-Download the files first:  python bronze/injection.py --source fires
+Download the files first:  python bronze/injection.py --source fire
+They are in data/raw/<year>/fire/, next to the INMET files in data/raw/<year>/inmet/.
 
 Run (from the inmet_weather folder):
-  python -m bronze.fire_ingest                  # all years in data/raw/fires, dev
+  python -m bronze.fire_ingest                  # all years in data/raw, dev
   python -m bronze.fire_ingest --years 2025     # only 2025
   python -m bronze.fire_ingest --env prod       # production lake
 """
@@ -53,7 +54,7 @@ FIRE_TABLES = ["fire_foci", "fire_quarantine", "fire_files"]   # change together
 # Step 1: read the files
 # ---------------------------------------------------------------------------
 # read_files() comes from bronze_ingest.py: one row per file with
-# source_file, source_year and the whole text (here decoded as UTF-8).
+# source_file, source_year and the whole text (here: UTF-8, folder "fire").
 
 def check_header(files):
     # Check line 1 of every file: it must be the 9 column names we expect.
@@ -161,14 +162,14 @@ def count_bad_lines(quarantine):
 def run_fire_bronze(spark, source, years=None, run_id=None):
     # Do all the steps: read the files, make the three tables, save them.
     if not years:
-        years = find_years(source)
+        years = find_years(source, folder="fire")
     now = datetime.now(timezone.utc)
     load_time = now.strftime("%Y-%m-%d %H:%M:%S")
     run_id = run_id or now.strftime("%Y%m%dT%H%M%SZ")
     print(f"FIRE BRONZE: loading years {years} (run {run_id})")
 
     # read every file only once, the next steps all use it
-    files = check_header(read_files(spark, source, years, ENCODING)).cache()
+    files = check_header(read_files(spark, source, years, ENCODING, folder="fire")).cache()
     lines = find_problems(only_data_lines(split_into_lines(files)))
 
     foci = make_foci(lines)
@@ -248,7 +249,7 @@ def main():
     # Read the command line options, start Spark and run the job.
     parser = argparse.ArgumentParser(description="Load INPE fire CSV files into Bronze tables.")
     project = Path(__file__).resolve().parents[1]          # the inmet_weather folder
-    parser.add_argument("--source", default=str(project / "data" / "raw" / "fires"))
+    parser.add_argument("--source", default=str(project / "data" / "raw"))
     parser.add_argument("--env", default="dev", choices=["dev", "prod"])
     parser.add_argument("--years", type=int, nargs="*")
     args = parser.parse_args()

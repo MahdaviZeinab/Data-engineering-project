@@ -84,33 +84,36 @@ DATABASE = "bronze"
 
 # Step 1: read the files
 # ---------------------------------------------------------------------------
-def find_years(source):
-    # Look in the raw folder and return the year folders, e.g. [2020, 2021].
+def find_years(source, folder="inmet"):
+    # Look in the raw folder and return the years that have this source's folder,
+    # e.g. [2020, 2021] when raw/2020/inmet and raw/2021/inmet exist.
     # We use this when the user does not say which years to load.
     years = []
     for name in os.listdir(source):
-        if name.isdigit() and len(name) == 4:
+        if name.isdigit() and len(name) == 4 and os.path.isdir(os.path.join(source, name, folder)):
             years.append(int(name))
     return sorted(years)
 
 
-def read_files(spark, source, years, encoding=ENCODING):
+def read_files(spark, source, years, encoding=ENCODING, folder="inmet"):
     # Read every CSV file of the chosen years. We get one row per file,
     # with the file name, the year and the whole text of the file.
     # We read the bytes ourselves so we can decode them as Latin-1;
     # then words like "PRECIPITAÇÃO" stay correct.
-    # The fire job uses it too, with encoding="UTF-8".
-    folders = [f"{source}/{year}" for year in years]
+    # The files are in <source>/<year>/inmet/. The fire job uses it too,
+    # with encoding="UTF-8" and folder="fire".
+    folders = [f"{source}/{year}/{folder}" for year in years]
     files = (spark.read.format("binaryFile")
              .option("pathGlobFilter", "*.[cC][sS][vV]")
              .load(folders))
 
-    # The path looks like ".../raw/2020/INMET_..._A_31-12-2020.CSV".
+    # The path looks like ".../raw/2020/inmet/INMET_..._A_31-12-2020.CSV":
+    # the file name is the last part, the year is two parts before it.
     # Spark writes a space as "%20" in the path, url_decode turns it back.
     path_parts = F.split(F.expr("url_decode(path)"), "/")
     return files.select(
         F.element_at(path_parts, -1).alias("source_file"),
-        F.element_at(path_parts, -2).cast("int").alias("source_year"),
+        F.element_at(path_parts, -3).cast("int").alias("source_year"),
         F.decode("content", encoding).alias("text"),
     )
 
