@@ -128,3 +128,24 @@ Saving works like Bronze: all Silver tables are first written to `<table>_new`, 
 If replacing one table fails, all of them get their old rows back.
 Before Silver reads Bronze, `check_tables_match` stops the job if the Bronze tables hold different runs
 (a killed Bronze run); then run Bronze again for those years.
+
+## Fires (`fire_build.py`, rules in [`fire_contract.py`](fire_contract.py))
+
+Reads `bronze.fire_foci` and saves `silver.fire_foci`, split by `source_year`.
+One row = one fire focus seen by the INPE reference satellite.
+
+| Rule | Value | Why |
+|---|---|---|
+| `KEY` | `foco_id` | INPE's id, unique per fire focus |
+| text | `trim`, empty → null | INPE writes spaces around numbers (`"   -3.650000 "`) |
+| types | `id_bdq` long, `lat`/`lon` double, `data_pas` → `observed_at_utc` (UTC) | all hours are 15–19 UTC, the afternoon satellite pass |
+| `state` | `STATE_TO_UF`: `MATO GROSSO` → `MT` | INMET uses the UF code; without this, a join on state finds **no rows and no error** |
+| `timezone`, `local_date` | from `STATE_TIMEZONE` (same as weather) | fires and weather land on the same local day |
+| `pais` | dropped | always `Brasil` |
+| duplicates | one row per `foco_id`: the one loaded last | a year loaded twice must not count fires twice |
+
+Problems are marked in `dq_issue` (first problem only), the row is kept:
+`missing_id`, `bad_timestamp`, `bad_coordinates`, `outside_brazil` (outside `BRAZIL_BOX`),
+`unknown_state` (no UF), `unknown_biome` (not one of the 6 `BIOMES`).
+
+Real 2020 file: 222,797 rows, 0 in quarantine, 0 duplicates, 0 rows with a `dq_issue`.

@@ -188,6 +188,10 @@ def run_silver(spark, years=None, run_id=None, summary=None):
     run_id = run_id or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     summary = {} if summary is None else summary
     hourly, files = read_bronze(spark, years)
+    # cache(): Spark is lazy and redoes every step for each count, check or save.
+    # We keep the tables we use many times, so each step runs only once.
+    # (cache() spills to disk when memory is full; spark.stop() frees it all.)
+    hourly = hourly.cache()                    # used for counts and the quality report
 
     df = check_schema(hourly)
     rows_in = rows_per_year(df)
@@ -197,7 +201,7 @@ def run_silver(spark, years=None, run_id=None, summary=None):
     df = cast_values(df)
     df = make_time(df, files)
     summary["duplicate_conflicts"] = count_conflicts(df)
-    df = remove_duplicates(df)
+    df = remove_duplicates(df).cache()         # the Window is the slowest step: run it once
     rows_left = rows_per_year(df)
     duplicates = {year: rows - rows_left.get(year, 0) for year, rows in rows_in.items()}
     summary["duplicates_removed"] = sum(duplicates.values())
@@ -212,12 +216,13 @@ def run_silver(spark, years=None, run_id=None, summary=None):
     good = add_station(good, files)
 
     run = F.lit(run_id)
-    good = good.withColumn("_silver_run_id", run)
-    quarantined = quarantined.withColumn("_silver_run_id", run)
+    good = good.withColumn("_silver_run_id", run).cache()                # checked, counted, saved
+    quarantined = quarantined.withColumn("_silver_run_id", run).cache()  # counted, saved
 
     # Silver 10: no row is lost, the rules hold, and a checksum to compare reruns.
     # If a check fails, the job stops here, so nothing is saved.
     counts = reconcile(rows_in, rows_per_year(good), rows_per_year(quarantined), duplicates)
+    df.unpersist()                             # good and quarantined are kept now
     check_silver(good)
     summary["reconcile"] = counts
     summary["checksum"] = checksum(good)

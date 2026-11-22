@@ -59,17 +59,17 @@ def source(tmp_path):
     raw = tmp_path / "raw"
     header = EXPECTED_HEADER + ";"
     # complete: 2 days = 48 hours
-    write(raw / "2020", "INMET_SE_SP_A001_SÃO PAULO_01-01-2020_A_02-01-2020.CSV",
+    write(raw / "2020" / "inmet", "INMET_SE_SP_A001_SÃO PAULO_01-01-2020_A_02-01-2020.CSV",
           station("A001", "SÃO PAULO") + [header] + hours(2))
     # 40 of 48 hours, one hour twice and one broken line
     rows = hours(2)[:40]
-    write(raw / "2020", "INMET_SE_SP_A002_CAMPINAS_01-01-2020_A_02-01-2020.CSV",
+    write(raw / "2020" / "inmet", "INMET_SE_SP_A002_CAMPINAS_01-01-2020_A_02-01-2020.CSV",
           station("A002", "CAMPINAS") + [header] + rows + [rows[-1], "2020/01/02;1700 UTC;0;1"])
     # a header that INMET never promised
-    write(raw / "2020", "INMET_SE_SP_A003_SANTOS_01-01-2020_A_01-01-2020.CSV",
+    write(raw / "2020" / "inmet", "INMET_SE_SP_A003_SANTOS_01-01-2020_A_01-01-2020.CSV",
           station("A003", "SANTOS") + ["Date;Hour;Rain;"] + hours(1))
     # another year
-    write(raw / "2021", "INMET_SE_SP_A001_SÃO PAULO_01-01-2021_A_01-01-2021.CSV",
+    write(raw / "2021" / "inmet", "INMET_SE_SP_A001_SÃO PAULO_01-01-2021_A_01-01-2021.CSV",
           station("A001", "SÃO PAULO") + [header] + hours(1, 2021))
     return str(raw)
 
@@ -183,8 +183,8 @@ def test_crash_while_writing_keeps_the_old_data(spark, source, monkeypatch):
 
 def test_year_without_files_stops_and_keeps_the_old_data(spark, source, tmp_path):
     run_bronze(spark, source, run_id="good")
-    (tmp_path / "raw" / "2022").mkdir()                      # an empty year folder
-    (tmp_path / "raw" / "2022" / "readme.txt").write_text("not a CSV")
+    (tmp_path / "raw" / "2022" / "inmet").mkdir(parents=True)   # a year folder without CSV files
+    (tmp_path / "raw" / "2022" / "inmet" / "readme.txt").write_text("not a CSV")
     with pytest.raises(Exception):
         run_bronze(spark, source, years=[2021, 2022], run_id="bad")
     ids = [r[0] for r in spark.table(HOURLY).select("_bronze_run_id").distinct().collect()]
@@ -232,7 +232,7 @@ def test_20th_value_must_be_empty(spark, tmp_path):
     good = hours(1)                                      # ends with ";" -> 20th is empty
     extra = good[1] + "99"                               # 20th value is "99"
     no_end = good[2][:-1]                                # 19 values, no ";" at the end
-    write(raw / "2020", "INMET_SE_SP_A001_SÃO PAULO_01-01-2020_A_01-01-2020.CSV",
+    write(raw / "2020" / "inmet", "INMET_SE_SP_A001_SÃO PAULO_01-01-2020_A_01-01-2020.CSV",
           station("A001", "SÃO PAULO") + [EXPECTED_HEADER + ";", good[0], extra, no_end])
     run_bronze(spark, str(raw))
 

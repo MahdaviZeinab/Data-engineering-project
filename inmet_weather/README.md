@@ -1,12 +1,16 @@
 # INMET weather – medallion pipeline (DAT535)
 
 Hourly weather data from INMET (Brazil), 2020–2025: about 3,470 station files, 2.2 GB.
+Second source: fire foci from INPE (Queimadas), one CSV per year (2020: 222,797 fire foci).
 Batch processing with Apache Spark and GitHub Actions.
 
 ```
-INMET website ─► bronze/injection.py ─► data/raw/<year>/*.CSV ─► bronze/bronze_ingest.py ─► Spark tables bronze.*
+INMET website ─► bronze/injection.py ─► data/raw/<year>/inmet/*.CSV ─► bronze/bronze_ingest.py ─► Spark tables bronze.*
                                                      silver/ reads spark.table("bronze.inmet_hourly") ─► Spark tables silver.*
                                                      gold/   (later)
+
+INPE website  ─► bronze/injection.py --source fire ─► data/raw/<year>/fire/*.csv ─► bronze/fire_ingest.py ─► bronze.fire_*
+                                                     silver/fire_build.py reads bronze.fire_foci ─► silver.fire_foci
 ```
 
 Each layer saves its result as **Spark tables** (`saveAsTable`, Parquet, split by year).
@@ -18,8 +22,9 @@ Every layer starts Spark and saves its tables with `common/spark.py`, so they al
 ```
 inmet_weather/
 ├── bronze/                 Bronze layer: getting the data in
-│   ├── injection.py        download + unzip the yearly INMET files
-│   └── bronze_ingest.py    Spark job: raw files -> Bronze Spark tables
+│   ├── injection.py        download + unzip the yearly files (INMET, or INPE with --source fire)
+│   ├── bronze_ingest.py    Spark job: raw files -> Bronze Spark tables
+│   └── fire_ingest.py      Spark job: fire files -> bronze.fire_* tables (same strategy as INMET)
 ├── common/
 │   ├── spark.py            start_spark() + save_table(): every layer uses the same Spark tables
 │   └── checks.py           small checks we run on a table before we save it
@@ -27,7 +32,9 @@ inmet_weather/
 ├── gold/                   Gold layer (later)
 ├── tests/                  tests for all layers
 ├── data/                   NOT in Git (see .gitignore)
-│   ├── raw/<year>/         the original INMET CSV files
+│   ├── raw/<year>.zip      the original INMET zip   (raw/fire_<year>.zip: the INPE fire zip)
+│   ├── raw/<year>/inmet/   the original INMET CSV files
+│   ├── raw/<year>/fire/    the original INPE fire CSV file
 │   └── lake/<env>/         the output: warehouse/ (Spark tables) + metastore_db/ (table list)
 ├── requirements.txt
 └── pytest.ini
@@ -52,6 +59,9 @@ python bronze/injection.py                    # download + unzip (skips finished
 python -m bronze.bronze_ingest                # Bronze, all years, dev
 python -m bronze.bronze_ingest --years 2025   # only 2025 (other years are not touched)
 python -m bronze.bronze_ingest --env prod     # production folder
+python bronze/injection.py --source fire      # fire files: download + unzip
+python -m bronze.fire_ingest                  # fire Bronze (same --years / --env options)
+python -m silver.fire_build                   # fire Silver
 python -m pytest -q                           # tests
 ```
 
@@ -65,6 +75,17 @@ If `DAT535_OUTPUT_DIR` is set (as in the course lab CI), the output goes there.
 | `bronze.inmet_files` | source file | station info (lines 1-8), header check, expected / received / missing hours, `status` (COMPLETE, COMPLETE_WITH_ISSUES, INCOMPLETE, QUARANTINED) |
 | `bronze.inmet_quarantine` | bad line | the raw line and the problem |
 | `bronze.runs` | run | when it ran, which years, how many files and rows |
+
+Fire tables (from `bronze/fire_ingest.py`):
+
+| Spark table | One row per | Content |
+|---|---|---|
+| `bronze.fire_foci` | fire focus | the 9 INPE values as text (spaces too), source file, line number, `_bronze_*` columns |
+| `bronze.fire_files` | source file (= one year) | header check, received rows / different fire ids / bad lines, `status` (COMPLETE, COMPLETE_WITH_ISSUES, QUARANTINED) |
+| `bronze.fire_quarantine` | bad line | the raw line and the problem (wrong header, not 9 values) |
+| `bronze.fire_runs` | run | when it ran, which years, how many files and rows |
+
+INPE does not say how many fires a file should have, so there is no INCOMPLETE status for fires.
 
 All tables are Parquet, split by `source_year`. Loading one year again only replaces that year.
 Saving happens in two steps: first all new rows go to `<table>_new` tables and are checked,
@@ -101,7 +122,8 @@ The workflows are in `.github/workflows/` at the repository root. Both run on ou
 | Years | 2025 only (fast) | all years 2020-2025 |
 | Writes to | `/data/inmet/lake/dev` | `/data/inmet/lake/prod` |
 
-Each run has two jobs: `bronze` (tests, download, Bronze tables), then `silver` (Silver tables).
+Each run has two jobs: `bronze` (tests, download, Bronze tables for weather and fires),
+then `silver` (Silver tables for weather and fires).
 `silver` starts only if `bronze` worked, so Silver always reads the Bronze tables of the same run.
 
 Branch flow:
