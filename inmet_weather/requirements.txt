@@ -1,4 +1,5 @@
 pyspark==3.5.3   # works with Java 8, 11 and 17
+numpy            # needed by Spark ML (the fire model)
 requests
 tqdm
 pytest
