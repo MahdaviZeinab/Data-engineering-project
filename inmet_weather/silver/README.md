@@ -148,4 +148,25 @@ Problems are marked in `dq_issue` (first problem only), the row is kept:
 `missing_id`, `bad_timestamp`, `bad_coordinates`, `outside_brazil` (outside `BRAZIL_BOX`),
 `unknown_state` (no UF), `unknown_biome` (not one of the 6 `BIOMES`).
 
+### Nearest weather station ([`nearest_station.py`](nearest_station.py))
+
+Every fire gets `nearest_station_code` and `distance_km` (still one row per fire), so Gold can join
+it with the weather of that station. It reads `silver.station_history`, so run `silver.stations` first.
+
+| Rule | Value | Why |
+|---|---|---|
+| stations used | `in_brazil` and the same `source_year` as the fire | no wrong coordinates, no station that did not exist that year |
+| distance | haversine, in km | real distance on the earth, not in degrees |
+| `GRID_DEG` | 1.0 | squares of about 111 km, see below |
+| `MAX_DISTANCE_KM` | 90 | further away, the station's weather says little about the fire |
+| same distance | lowest `station_code` | every run gives the same answer |
+
+**Why a grid:** comparing every fire with every station is about 136,000 × 600 pairs a year.
+Instead, each station is put in its own 1° square and the 8 squares around it, and a fire is only
+compared with the stations of its own square (a few at most). Below 90 km, a station is always in
+one of those 9 squares (1° of longitude is still ~92 km in the far south), so no close station is missed.
+The station table is small, so it is broadcast to every worker.
+
+A fire with no station within 90 km gets null and `dq_issue = no_station_nearby` (only when it has no other problem).
+
 Real 2020 file: 222,797 rows, 0 in quarantine, 0 duplicates, 0 rows with a `dq_issue`.

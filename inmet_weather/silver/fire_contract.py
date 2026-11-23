@@ -55,3 +55,11 @@ BIOMES = ["Amazônia", "Caatinga", "Cerrado", "Mata Atlântica", "Pampa", "Panta
 
 # Bronze columns we do not keep in Silver: "pais" is always "Brasil".
 DROP = ["pais"]
+
+# Nearest weather station (silver/nearest_station.py).
+# Size of the grid squares, in degrees (1 degree is about 111 km).
+GRID_DEG = 1.0
+# A station further away than this is not used: the fire gets no station.
+# Keep it below about 90 km for 1 degree squares: then a closer station
+# is always in the 9 squares we look at (1 degree of longitude is ~92 km in the far south).
+MAX_DISTANCE_KM = 90.0

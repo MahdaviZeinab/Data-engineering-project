@@ -8,7 +8,10 @@ Steps:
      with the weather data (same UF codes, same time zones)
   4. mark rows with a problem in dq_issue (the rows are kept)
   5. remove double rows (same foco_id)
-  6. save silver.fire_foci (split by year)
+  6. add the nearest weather station (silver/nearest_station.py)
+  7. save silver.fire_foci (split by year)
+
+Run silver.stations first: step 6 reads silver.station_history.
 
 All rules are in silver/fire_contract.py (fire only) and silver/contract.py (shared).
 
@@ -32,6 +35,7 @@ from bronze.bronze_ingest import check_tables_match
 from common.checks import has_columns, not_empty, one_row_per, run_checks
 from common.spark import save_table, start_spark
 from silver import contract, fire_contract
+from silver.nearest_station import add_nearest_station, mark_no_station
 
 TABLE = "silver.fire_foci"
 
@@ -131,8 +135,9 @@ def remove_duplicates(df):
 
 # The whole job
 # ---------------------------------------------------------------------------
-def run_fire_silver(spark, years=None, run_id=None):
+def run_fire_silver(spark, years=None, run_id=None, stations=None):
     # Do all the steps and return the clean table (not saved yet).
+    # stations: the station table to use (tests give a small one).
     run_id = run_id or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     df = cast_values(read_bronze(spark, years))
     df = add_state_and_time(spark, df)
@@ -141,6 +146,9 @@ def run_fire_silver(spark, years=None, run_id=None):
     df = mark_problems(df).cache()             # counted twice, then cleaned
     print("FIRE SILVER: double rows removed:", count_duplicates(df))
     df = remove_duplicates(df)
+    if stations is None:
+        stations = spark.table("silver.station_history")
+    df = mark_no_station(add_nearest_station(df, stations))
     return df.withColumn("_silver_run_id", F.lit(run_id)).cache()   # checked, then saved
 
 
@@ -161,7 +169,7 @@ def print_summary(spark, years=None):
     result.groupBy("source_year").count().orderBy("source_year").show()
     result.groupBy("dq_issue").count().show()
     result.select("foco_id", "observed_at_utc", "local_date", "state", "municipality",
-                  "biome", "lat", "lon").show(5, truncate=False)
+                  "biome", "lat", "lon", "nearest_station_code", "distance_km").show(5, truncate=False)
 
 
 def main():
