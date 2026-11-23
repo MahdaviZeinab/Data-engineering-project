@@ -37,8 +37,8 @@ from pyspark.ml import Pipeline
 from pyspark.ml.classification import LogisticRegression
 from pyspark.ml.evaluation import BinaryClassificationEvaluator
 from pyspark.ml.feature import OneHotEncoder, StandardScaler, StringIndexer, VectorAssembler
-from pyspark.ml.functions import vector_to_array
 from pyspark.sql import functions as F
+from pyspark.sql.types import DoubleType
 from pyspark.sql.window import Window
 
 from common.spark import save_table, start_spark
@@ -121,10 +121,15 @@ def make_pipeline():
     ])
 
 
+# The model gives a vector [P(0), P(1)]; this takes P(1) out as a plain number.
+# (A small Python function: pyspark.ml.functions.vector_to_array would also work,
+#  but it needs the pandas library, which the pipeline does not install.)
+second_value = F.udf(lambda vector: float(vector[1]), DoubleType())
+
+
 def add_probability(predictions):
-    # The model gives a vector [P(0), P(1)]; keep P(1) as a plain number.
-    return predictions.withColumn("probability_high",
-                                  F.element_at(vector_to_array("probability"), 2))
+    # Keep P(high-fire day) as a plain number column.
+    return predictions.withColumn("probability_high", second_value("probability"))
 
 
 # Step 4: how good is it?
