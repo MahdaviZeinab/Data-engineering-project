@@ -6,12 +6,15 @@ Steps:
   2. clean the text and turn it into numbers and a time ("  -3.650000 " -> -3.65)
   3. add the state code (UF) and the local time, so fires can be joined
      with the weather data (same UF codes, same time zones)
-  4. mark rows with a problem in dq_issue (the rows are kept)
+  4. mark rows with a problem in dq_issue, also a point outside its state
+     (silver/state_check.py)
   5. remove double rows (same foco_id)
-  6. add the nearest weather station (silver/nearest_station.py)
-  7. save silver.fires (split by year)
+  6. move rows with a problem to silver.fire_quarantine
+  7. add the nearest weather station (silver/nearest_station.py)
+  8. merge points of the same fire into one fire event (silver/fire_events.py)
+  9. save silver.fires and silver.fire_quarantine together (split by year)
 
-Run silver.stations first: step 6 reads silver.station_history.
+Run silver.stations first: step 7 reads silver.station_history.
 
 All rules are in silver/fire_contract.py (fire only) and silver/contract.py (shared).
 
@@ -33,11 +36,14 @@ from pyspark.sql.window import Window
 from bronze.fire_ingest import FIRE_TABLES
 from bronze.bronze_ingest import check_tables_match
 from common.checks import has_columns, not_empty, one_row_per, run_checks
-from common.spark import save_table, start_spark
+from common.spark import move_all_from_staging, save_to_staging, start_spark
 from silver import contract, fire_contract
+from silver.fire_events import add_fire_events
 from silver.nearest_station import add_nearest_station, mark_no_station
+from silver.state_check import inside_state
 
 TABLE = "silver.fires"
+QUARANTINE = "silver.fire_quarantine"
 
 
 # Step 1: read Bronze and check it
@@ -104,12 +110,13 @@ def inside_brazil():
 
 def mark_problems(df):
     # dq_issue = the first problem of the row, or null when the row is fine.
-    # We keep the rows, so Gold can decide what to do with them.
+    # Rows with a problem go to silver.fire_quarantine (step 6).
     problem = (F.when(F.col("foco_id").isNull(), "missing_id")
                 .when(F.col("observed_at_utc").isNull(), "bad_timestamp")
                 .when(F.col("lat").isNull() | F.col("lon").isNull(), "bad_coordinates")
                 .when(~inside_brazil(), "outside_brazil")
                 .when(F.col("state").isNull(), "unknown_state")
+                .when(~inside_state(), "wrong_state")
                 .when(~F.col("biome").isin(fire_contract.BIOMES), "unknown_biome"))
     return df.withColumn("dq_issue", problem)
 
@@ -133,10 +140,18 @@ def remove_duplicates(df):
     return df.where(keep).drop("rank", "_bronze_ingestion_time")
 
 
+# Step 6: quarantine
+# ---------------------------------------------------------------------------
+def split_quarantine(df):
+    # Good rows (no problem) and quarantine rows (with a problem in dq_issue).
+    # Nothing is thrown away: every row ends up in one of the two tables.
+    return df.where(F.col("dq_issue").isNull()), df.where(F.col("dq_issue").isNotNull())
+
+
 # The whole job
 # ---------------------------------------------------------------------------
 def run_fire_silver(spark, years=None, run_id=None, stations=None):
-    # Do all the steps and return the clean table (not saved yet).
+    # Do all the steps and return (fires, quarantine), not saved yet.
     # stations: the station table to use (tests give a small one).
     run_id = run_id or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     df = cast_values(read_bronze(spark, years))
@@ -146,19 +161,26 @@ def run_fire_silver(spark, years=None, run_id=None, stations=None):
     df = mark_problems(df).cache()             # counted twice, then cleaned
     print("FIRE SILVER: double rows removed:", count_duplicates(df))
     df = remove_duplicates(df)
+    fires, quarantine = split_quarantine(df)
     if stations is None:
         stations = spark.table("silver.station_history")
-    df = mark_no_station(add_nearest_station(df, stations))
-    return df.withColumn("_silver_run_id", F.lit(run_id)).cache()   # checked, then saved
+    fires = mark_no_station(add_nearest_station(fires, stations))
+    fires = add_fire_events(fires)
+    run = F.lit(run_id)
+    # cache(): both are checked, then saved
+    return (fires.withColumn("_silver_run_id", run).cache(),
+            quarantine.withColumn("_silver_run_id", run).cache())
 
 
-def save_fire_silver(spark, silver, years=None):
-    # Check the table, then save it: first to "<name>_new", then into the real table.
+def save_fire_silver(spark, fires, quarantine, years=None):
+    # Check the tables, then save both together: first to "<name>_new",
+    # then into the real tables (if one fails, both get their old rows back).
     # Only the years we ran are replaced.
-    with_id = silver.where(F.col("foco_id").isNotNull())
-    run_checks(silver, [not_empty, has_columns("foco_id", "observed_at_utc", "state", "local_date")])
-    run_checks(with_id, [one_row_per(*fire_contract.KEY)])
-    save_table(spark, silver, TABLE, years)
+    run_checks(fires, [not_empty, has_columns("foco_id", "observed_at_utc", "state", "local_date"),
+                       one_row_per(*fire_contract.KEY)])
+    save_to_staging(spark, fires, TABLE)
+    save_to_staging(spark, quarantine, QUARANTINE)
+    move_all_from_staging(spark, {TABLE: years, QUARANTINE: years})
 
 
 def print_summary(spark, years=None):
@@ -168,8 +190,16 @@ def print_summary(spark, years=None):
         result = result.where(F.col("source_year").isin(years))
     result.groupBy("source_year").count().orderBy("source_year").show()
     result.groupBy("dq_issue").count().show()
+    print("FIRE SILVER: fire points:", result.count(),
+          "| fire events:", result.where("first_in_event").count())
     result.select("foco_id", "observed_at_utc", "local_date", "state", "municipality",
-                  "biome", "lat", "lon", "nearest_station_code", "distance_km").show(5, truncate=False)
+                  "biome", "nearest_station_code", "distance_km", "fire_event_id",
+                  "points_in_event").show(5, truncate=False)
+    quarantine = spark.table(QUARANTINE)
+    if years:
+        quarantine = quarantine.where(F.col("source_year").isin(years))
+    print(f"FIRE SILVER: rows in {QUARANTINE}, by problem:")
+    quarantine.groupBy("dq_issue").count().show()
 
 
 def main():
@@ -185,9 +215,9 @@ def main():
     spark = start_spark("fire-silver", lake, memory="2g")
     try:
         check_tables_match(spark, args.years, FIRE_TABLES)  # stop after a killed Bronze run
-        silver = run_fire_silver(spark, args.years)
-        save_fire_silver(spark, silver, args.years)
-        print(f"FIRE SILVER: saved {TABLE}")
+        fires, quarantine = run_fire_silver(spark, args.years)
+        save_fire_silver(spark, fires, quarantine, args.years)
+        print(f"FIRE SILVER: saved {TABLE} and {QUARANTINE}")
         print_summary(spark, args.years)
         return 0
     except Exception as error:
