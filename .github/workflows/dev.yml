@@ -118,6 +118,18 @@ jobs:
           DAT535_OUTPUT_DIR: ${{ env.DATA_ROOT }}/lake/${{ env.LAKE_ENV }}
         run: $DATA_ROOT/venv/bin/python -m silver.fire_build --env "$LAKE_ENV" --years $YEARS
 
+
+
+      - name: Build Gold (fire risk)
+        env:
+          DAT535_OUTPUT_DIR: ${{ env.DATA_ROOT }}/lake/${{ env.LAKE_ENV }}
+        run: $DATA_ROOT/venv/bin/python -m gold.gold_build --env "$LAKE_ENV" --years $YEARS
+
+      - name: Train fire model (logistic regression)
+        env:
+          DAT535_OUTPUT_DIR: ${{ env.DATA_ROOT }}/lake/${{ env.LAKE_ENV }}
+        run: $DATA_ROOT/venv/bin/python -m ml.train_fire_model --env "$LAKE_ENV" --valid-from 2025-07-01 --test-from 2025-09-01
+
       - name: Write run summary
         if: always()
         run: |
