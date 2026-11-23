@@ -26,19 +26,21 @@ def rows_per_year(df):
 # ---------------------------------------------------------------------------
 def reconcile(rows_in, rows_out, rows_quarantined, duplicates):
     # Every Bronze row must end up in exactly one place, for every year:
-    #   rows_in = rows_out + rows_quarantined + duplicates_removed
+    #   rows_read_from_bronze = good_rows_saved_in_silver
+    #                           + bad_rows_moved_to_quarantine + duplicate_rows_removed
     # Returns the numbers per year. Stops the job if one year does not add up.
     result, problems = {}, []
     for year in sorted(rows_in):
         counts = {
-            "rows_in": rows_in[year],
-            "rows_out": rows_out.get(year, 0),
-            "rows_quarantined": rows_quarantined.get(year, 0),
-            "duplicates_removed": duplicates.get(year, 0),
+            "rows_read_from_bronze": rows_in[year],
+            "good_rows_saved_in_silver": rows_out.get(year, 0),
+            "bad_rows_moved_to_quarantine": rows_quarantined.get(year, 0),
+            "duplicate_rows_removed": duplicates.get(year, 0),
         }
         result[year] = counts
-        accounted = counts["rows_out"] + counts["rows_quarantined"] + counts["duplicates_removed"]
-        if accounted != counts["rows_in"]:
+        accounted = (counts["good_rows_saved_in_silver"] + counts["bad_rows_moved_to_quarantine"]
+                     + counts["duplicate_rows_removed"])
+        if accounted != counts["rows_read_from_bronze"]:
             problems.append(f"{year}: {counts}")
     if problems:
         raise ValueError("Reconcile failed, rows were lost or added: " + "; ".join(problems))
@@ -74,19 +76,21 @@ def quality_report(bronze, good, counts):
     # Before: INMET's "no value" codes in Bronze (empty or -9999)
     no_value = sum((F.col(c).isNull() | F.trim(F.col(c)).isin(contract.MISSING_CODES)).cast("int")
                    for c in contract.RENAME)
-    before = bronze.groupBy("source_year").agg(F.sum(no_value).alias("missing_values_in"))
+    before = bronze.groupBy("source_year").agg(F.sum(no_value).alias("empty_values_in_bronze"))
 
     # After: empty values, invalid values (made empty) and unusual values (kept) in Silver
     empty = sum(F.col(c).isNull().cast("int") for c in contract.MEASUREMENTS)
     after = good.groupBy("source_year").agg(
-        F.sum(empty).alias("empty_values_out"),
-        F.sum(count_flags_starting_with("invalid_")).alias("values_invalid"),
-        F.sum(count_flags_starting_with("unusual_")).alias("values_unusual"),
+        F.sum(empty).alias("empty_values_in_silver"),
+        F.sum(count_flags_starting_with("invalid_")).alias("impossible_values_set_to_empty"),
+        F.sum(count_flags_starting_with("unusual_")).alias("rare_values_kept_with_flag"),
     )
 
     rows = spark.createDataFrame(
-        [(year, c["rows_in"], c["duplicates_removed"], c["rows_quarantined"], c["rows_out"])
+        [(year, c["rows_read_from_bronze"], c["duplicate_rows_removed"],
+          c["bad_rows_moved_to_quarantine"], c["good_rows_saved_in_silver"])
          for year, c in counts.items()],
-        "source_year int, rows_in long, duplicates_removed long, rows_quarantined long, rows_out long")
+        "source_year int, rows_read_from_bronze long, duplicate_rows_removed long, "
+        "bad_rows_moved_to_quarantine long, good_rows_saved_in_silver long")
     report = rows.join(before, "source_year", "left").join(after, "source_year", "left")
     return report.fillna(0).orderBy("source_year")

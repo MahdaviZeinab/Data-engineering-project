@@ -131,7 +131,7 @@ Before Silver reads Bronze, `check_tables_match` stops the job if the Bronze tab
 
 ## Fires (`fire_build.py`, rules in [`fire_contract.py`](fire_contract.py))
 
-Reads `bronze.fire_foci` and saves `silver.fire_foci`, split by `source_year`.
+Reads `bronze.fire_foci` and saves `silver.fires`, split by `source_year`.
 One row = one fire focus seen by the INPE reference satellite.
 
 | Rule | Value | Why |

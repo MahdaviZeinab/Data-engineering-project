@@ -52,14 +52,14 @@ measurement and year; time formats; hours per station per day).
 
 Table `silver.quality_report`, one row per year:
 
-| Year | rows_in | duplicates_removed | rows_quarantined | rows_out | missing_values_in | empty_values_out | values_invalid | values_unusual |
+| source_year | rows_read_from_bronze | duplicate_rows_removed | bad_rows_moved_to_quarantine | good_rows_saved_in_silver | empty_values_in_bronze | empty_values_in_silver | impossible_values_set_to_empty | rare_values_kept_with_flag |
 |---|---|---|---|---|---|---|---|---|
 | 2020 | TODO (VM) | | | | | | | |
 | … | | | | | | | | |
 | 2025 | | | | | | | | |
 
-- `missing_values_in`: INMET's "no value" codes in Bronze (`""` or `-9999`). In Silver they are empty (null), never `-9999`.
-- `empty_values_out`: empty values left in Silver (the missing ones, plus invalid values we made empty).
+- `empty_values_in_bronze`: INMET's "no value" codes in Bronze (`""` or `-9999`). In Silver they are empty (null), never `-9999`.
+- `empty_values_in_silver`: empty values left in Silver (the missing ones, plus invalid values we made empty).
 - Biggest problem we found (1–2 sentences): `TODO`
 
 ## 6. Invalid vs unusual values (S8)

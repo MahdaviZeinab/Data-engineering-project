@@ -9,7 +9,7 @@ Steps:
   4. mark rows with a problem in dq_issue (the rows are kept)
   5. remove double rows (same foco_id)
   6. add the nearest weather station (silver/nearest_station.py)
-  7. save silver.fire_foci (split by year)
+  7. save silver.fires (split by year)
 
 Run silver.stations first: step 6 reads silver.station_history.
 
@@ -37,7 +37,7 @@ from common.spark import save_table, start_spark
 from silver import contract, fire_contract
 from silver.nearest_station import add_nearest_station, mark_no_station
 
-TABLE = "silver.fire_foci"
+TABLE = "silver.fires"
 
 
 # Step 1: read Bronze and check it
@@ -174,7 +174,7 @@ def print_summary(spark, years=None):
 
 def main():
     # Read the command line options, start Spark, clean the data and save it.
-    parser = argparse.ArgumentParser(description="Build silver.fire_foci from Bronze.")
+    parser = argparse.ArgumentParser(description="Build silver.fires from Bronze.")
     parser.add_argument("--env", default="dev", choices=["dev", "prod"])
     parser.add_argument("--years", type=int, nargs="*")
     args = parser.parse_args()

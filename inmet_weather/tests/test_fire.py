@@ -180,4 +180,4 @@ def test_silver_marks_problems_and_removes_doubles(spark, tmp_path):
     assert issues == {"ok": None, "x1": "unknown_state", "x2": "outside_brazil",
                       "x3": "unknown_biome", "x4": "bad_timestamp"}
     save_fire_silver(spark, silver, [2020])
-    assert spark.table("silver.fire_foci").count() == 5
+    assert spark.table("silver.fires").count() == 5
