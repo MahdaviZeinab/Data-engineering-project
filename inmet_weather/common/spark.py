@@ -55,9 +55,11 @@ def put_rows_in_table(spark, name, rows_table, years=None):
 
     exists = spark.catalog.tableExists(name)
     same_columns = exists and set(spark.table(name).columns) == set(rows.columns)
-    if years and exists and not same_columns:
-        print(f"NOTE: the columns of {name} changed, so the whole table is replaced. "
-              "Years you did not run are gone until you run all years again.")
+    if years and exists and not same_columns and "source_year" in rows.columns:
+        old_years = {r[0] for r in spark.table(name).select("source_year").distinct().collect()}
+        if old_years - set(years):
+            raise ValueError(f"The columns of {name} changed: run all years, "
+                             f"or the years {sorted(old_years - set(years))} would be deleted.")
 
     if years and same_columns:
         for year in years:
