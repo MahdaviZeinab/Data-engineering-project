@@ -86,17 +86,18 @@ def test_rerun_gives_the_same_checksum(spark):
     run_silver(spark, run_id="run1", summary=first)
     run_silver(spark, run_id="run2", summary=second)        # other run id, same data
     assert first["checksum"] == second["checksum"]
-    assert first["reconcile"] == {2021: {"rows_in": 3, "rows_out": 2,
-                                         "rows_quarantined": 0, "duplicates_removed": 1}}
+    assert first["reconcile"] == {2021: {"rows_read_from_bronze": 3, "good_rows_saved_in_silver": 2,
+                                         "bad_rows_moved_to_quarantine": 0,
+                                         "duplicate_rows_removed": 1}}
 
 
 def test_quality_report_numbers(spark):
     good_bronze(spark)
     good, quarantined, report = run_silver(spark, run_id="r1")
     row = report.first().asDict()
-    assert (row["source_year"], row["rows_in"], row["duplicates_removed"],
-            row["rows_quarantined"], row["rows_out"]) == (2021, 3, 1, 0, 2)
-    assert row["missing_values_in"] == 0
+    assert (row["source_year"], row["rows_read_from_bronze"], row["duplicate_rows_removed"],
+            row["bad_rows_moved_to_quarantine"], row["good_rows_saved_in_silver"]) == (2021, 3, 1, 0, 2)
+    assert row["empty_values_in_bronze"] == 0
 
 
 def test_stops_on_wrong_schema(spark):

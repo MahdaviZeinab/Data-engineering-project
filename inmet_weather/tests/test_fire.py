@@ -154,7 +154,9 @@ def stations(spark):
 def test_silver_types_state_and_local_date(spark, tmp_path):
     write(tmp_path, 2020, [line("a", state="MATO GROSSO", time="2020-06-16 02:00:00")])
     run_fire_bronze(spark, str(tmp_path), [2020])
-    row = run_fire_silver(spark, stations=stations(spark)).first()
+    fires, quarantine = run_fire_silver(spark, stations=stations(spark))
+    row = fires.first()
+    assert quarantine.count() == 0
 
     assert row["lat"] == -10.513
     assert row["state"] == "MT"                       # full name -> UF, like INMET
@@ -162,9 +164,10 @@ def test_silver_types_state_and_local_date(spark, tmp_path):
     assert str(row["local_date"]) == "2020-06-15"     # 02:00 UTC is still the 15th in Cuiabá
     assert row["dq_issue"] is None
     assert row["nearest_station_code"] == "A001"
+    assert (row["fire_event_id"], row["points_in_event"], row["first_in_event"]) == ("a", 1, True)
 
 
-def test_silver_marks_problems_and_removes_doubles(spark, tmp_path):
+def test_silver_moves_problems_to_quarantine_and_removes_doubles(spark, tmp_path):
     write(tmp_path, 2020, [
         line("ok"),
         line("ok"),                                   # the same focus twice
@@ -172,12 +175,15 @@ def test_silver_marks_problems_and_removes_doubles(spark, tmp_path):
         line("x2", lat="  45.0 "),
         line("x3", biome="Sahara"),
         line("x4", time="not a time"),
+        line("x5", state="SÃO PAULO"),                # the point is in Mato Grosso
     ])
     run_fire_bronze(spark, str(tmp_path), [2020])
-    silver = run_fire_silver(spark, stations=stations(spark))
-    issues = {r["foco_id"]: r["dq_issue"] for r in silver.collect()}
+    fires, quarantine = run_fire_silver(spark, stations=stations(spark))
+    issues = {r["foco_id"]: r["dq_issue"] for r in quarantine.collect()}
 
-    assert issues == {"ok": None, "x1": "unknown_state", "x2": "outside_brazil",
-                      "x3": "unknown_biome", "x4": "bad_timestamp"}
-    save_fire_silver(spark, silver, [2020])
-    assert spark.table("silver.fire_foci").count() == 5
+    assert [r["foco_id"] for r in fires.collect()] == ["ok"]
+    assert issues == {"x1": "unknown_state", "x2": "outside_brazil", "x3": "unknown_biome",
+                      "x4": "bad_timestamp", "x5": "wrong_state"}
+    save_fire_silver(spark, fires, quarantine, [2020])
+    assert spark.table("silver.fires").count() == 1
+    assert spark.table("silver.fire_quarantine").count() == 5

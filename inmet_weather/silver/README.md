@@ -131,8 +131,8 @@ Before Silver reads Bronze, `check_tables_match` stops the job if the Bronze tab
 
 ## Fires (`fire_build.py`, rules in [`fire_contract.py`](fire_contract.py))
 
-Reads `bronze.fire_foci` and saves `silver.fire_foci`, split by `source_year`.
-One row = one fire focus seen by the INPE reference satellite.
+Reads `bronze.fire_foci` and saves `silver.fires` and `silver.fire_quarantine` (together), split by `source_year`.
+One row = one fire point (focus) seen by the INPE reference satellite.
 
 | Rule | Value | Why |
 |---|---|---|
@@ -144,9 +144,39 @@ One row = one fire focus seen by the INPE reference satellite.
 | `pais` | dropped | always `Brasil` |
 | duplicates | one row per `foco_id`: the one loaded last | a year loaded twice must not count fires twice |
 
-Problems are marked in `dq_issue` (first problem only), the row is kept:
-`missing_id`, `bad_timestamp`, `bad_coordinates`, `outside_brazil` (outside `BRAZIL_BOX`),
-`unknown_state` (no UF), `unknown_biome` (not one of the 6 `BIOMES`).
+### Quarantine and the state check ([`state_check.py`](state_check.py))
+
+A row with a problem gets it in `dq_issue` (first problem only) and moves to `silver.fire_quarantine`.
+Nothing is thrown away: every Bronze row is in `silver.fires`, in the quarantine, or a removed duplicate.
+
+| `dq_issue` | Meaning |
+|---|---|
+| `missing_id` | no `foco_id` |
+| `bad_timestamp` | the date or time can't be read |
+| `bad_coordinates` | no `lat` or `lon` |
+| `outside_brazil` | outside `BRAZIL_BOX` |
+| `unknown_state` | the state name is not in `STATE_TO_UF` |
+| `wrong_state` | the point is not inside the box of its state (`STATE_BOX` + `STATE_BOX_MARGIN_DEG` = 0.1°, ~11 km) |
+| `unknown_biome` | not one of the 6 `BIOMES` |
+
+**Why a box per state, not the real border:** the real borders need a map file and a geo library.
+A box is 4 numbers per state and plain Spark. It finds the big mistakes (wrong state name, lat and lon swapped),
+but not a fire a few km on the wrong side of a border, because the boxes of neighbouring states overlap.
+
+### The same fire seen twice ([`fire_events.py`](fire_events.py))
+
+A big fire is often seen as several points next to each other (one per satellite pixel).
+Points on the same `local_date` in the same `EVENT_GRID_DEG` square (0.01°, about 1 km) are **one fire event**.
+Every point keeps its row, and gets:
+
+| Column | Meaning |
+|---|---|
+| `fire_event_id` | `foco_id` of the first point of the event |
+| `points_in_event` | how many points the event has |
+| `first_in_event` | true for one point per event: count fires with `where first_in_event` |
+
+**Why squares:** a window over (day, square) is simple and fast. Two points 100 m apart but on
+two sides of a square's edge become two events; with 1 km squares this is rare.
 
 ### Nearest weather station ([`nearest_station.py`](nearest_station.py))
 
@@ -167,6 +197,7 @@ compared with the stations of its own square (a few at most). Below 90 km, a sta
 one of those 9 squares (1° of longitude is still ~92 km in the far south), so no close station is missed.
 The station table is small, so it is broadcast to every worker.
 
-A fire with no station within 90 km gets null and `dq_issue = no_station_nearby` (only when it has no other problem).
+A fire with no station within 90 km gets null and `dq_issue = no_station_nearby`.
+It stays in `silver.fires`: the fire is fine, there is just no weather station close to it.
 
 Real 2020 file: 222,797 rows, 0 in quarantine, 0 duplicates, 0 rows with a `dq_issue`.

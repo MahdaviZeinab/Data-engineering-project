@@ -10,7 +10,7 @@ INMET website ─► bronze/injection.py ─► data/raw/<year>/inmet/*.CSV ─�
                                                      gold/   (later)
 
 INPE website  ─► bronze/injection.py --source fire ─► data/raw/<year>/fire/*.csv ─► bronze/fire_ingest.py ─► bronze.fire_*
-                                                     silver/fire_build.py reads bronze.fire_foci ─► silver.fire_foci
+                                                     silver/fire_build.py reads bronze.fire_foci ─► silver.fires
 ```
 
 Each layer saves its result as **Spark tables** (`saveAsTable`, Parquet, split by year).

@@ -19,7 +19,7 @@ def spark():
 def test_reconcile_ok():
     counts = reconcile(rows_in={2021: 10}, rows_out={2021: 7},
                        rows_quarantined={2021: 2}, duplicates={2021: 1})
-    assert counts[2021]["rows_out"] == 7
+    assert counts[2021]["good_rows_saved_in_silver"] == 7
 
 
 def test_reconcile_stops_when_a_row_is_lost():
