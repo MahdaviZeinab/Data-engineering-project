@@ -36,7 +36,8 @@ from pyspark.sql.window import Window
 from bronze.fire_ingest import FIRE_TABLES
 from bronze.bronze_ingest import check_tables_match
 from common.checks import has_columns, not_empty, one_row_per, run_checks
-from common.report import add_to_summary, check_invalid_share, markdown_table, percent, report_failure
+from common.report import (add_to_summary, check_invalid_share, markdown_table, percent,
+                           report_failure, show_tables)
 from common.spark import move_all_from_staging, save_to_staging, start_spark
 from silver import contract, fire_contract
 from silver.fire_events import add_fire_events
@@ -258,6 +259,8 @@ def main():
         print(f"FIRE SILVER: saved {TABLE} and {QUARANTINE}")
         print_summary(spark, args.years)
         write_report(spark, args.years)        # the result on the GitHub run page
+        add_to_summary("**Silver fire tables** (click a table to see its first rows)")
+        show_tables(spark, [TABLE, QUARANTINE], args.years)
         return 0
     except Exception as error:
         print("FIRE SILVER FAILED:", error)

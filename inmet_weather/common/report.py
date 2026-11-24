@@ -12,12 +12,15 @@ Outside GitHub (on a laptop, in the tests) the text is only printed.
   check_invalid_share(...)          a WARNING when more than MAX_INVALID_PCT % of the rows
                                     of a year are invalid (the job does not stop)
   report_failure(job, error)        show the error of a failed job on the run page
+  show_tables(spark, tables, years) for each table: rows, columns and its first 10 rows
 """
 
 import os
 
 MAX_INVALID_PCT = 25        # more invalid rows than this (in %) gives a warning
 MAX_ERROR_CHARS = 2000      # Spark errors can be very long; show only the start
+MAX_SAMPLE_ROWS = 10        # rows shown per table
+MAX_VALUE_CHARS = 60        # longer values are cut, so the table stays readable
 
 
 def add_to_summary(text):
@@ -60,3 +63,28 @@ def report_failure(job, error):
     first_line = text.splitlines()[0]
     print(f"::error title={job} failed::{first_line}")
     add_to_summary(f"### {job}: FAILED\n\n```\n{text[:MAX_ERROR_CHARS]}\n```")
+
+
+def short_value(value):
+    # One cell of the Markdown table: empty for null, no "|" or line breaks, not too long.
+    text = "" if value is None else str(value)
+    text = text.replace("|", "\\|").replace("\r", " ").replace("\n", " ")
+    return text if len(text) <= MAX_VALUE_CHARS else text[:MAX_VALUE_CHARS] + "..."
+
+
+def show_tables(spark, tables, years=None):
+    # For every saved table: its number of rows and columns, and its first 10 rows.
+    # Each table is in a part you open with a click (<details>), so the page stays short.
+    # Tables split by source_year show only the years of this run.
+    for name in tables:
+        df = spark.table(name)
+        if years and "source_year" in df.columns:
+            df = df.where(df["source_year"].isin(years))
+        first_rows = df.limit(MAX_SAMPLE_ROWS).collect()
+        title = f"{name}: {df.count():,} rows, {len(df.columns)} columns"
+        if first_rows:
+            body = markdown_table(df.columns, [[short_value(v) for v in row] for row in first_rows])
+        else:
+            body = "(no rows)"
+        add_to_summary(f"<details><summary>{title}</summary>\n\n{body}\n\n</details>")
+

@@ -2,8 +2,9 @@
 Tests for common/report.py (no Spark needed).
 Run:  python -m pytest -q tests/test_report.py
 """
-from common.report import (MAX_INVALID_PCT, add_to_summary, check_invalid_share,
-                           markdown_table, percent, report_failure)
+from common.report import (MAX_INVALID_PCT, MAX_VALUE_CHARS, add_to_summary,
+                           check_invalid_share, markdown_table, percent, report_failure,
+                           short_value)
 
 
 def test_percent():
@@ -37,3 +38,10 @@ def test_no_github_file_only_prints(monkeypatch, capsys):
     monkeypatch.delenv("GITHUB_STEP_SUMMARY", raising=False)
     add_to_summary("hello")
     assert "hello" in capsys.readouterr().out
+
+
+def test_short_value():
+    assert short_value(None) == ""
+    assert short_value("a|b\nc") == "a\\|b c"            # no broken table cells
+    assert short_value("x" * 100) == "x" * MAX_VALUE_CHARS + "..."
+

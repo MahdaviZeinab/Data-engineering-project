@@ -35,7 +35,8 @@ from pyspark.sql.window import Window
 
 from common.checks import has_columns, not_empty, run_checks
 from bronze.bronze_ingest import check_tables_match
-from common.report import add_to_summary, check_invalid_share, markdown_table, percent, report_failure
+from common.report import (add_to_summary, check_invalid_share, markdown_table, percent,
+                           report_failure, show_tables)
 from common.spark import move_all_from_staging, save_to_staging, start_spark
 from silver import contract
 from silver.quality import check_silver, checksum, quality_report, reconcile, rows_per_year
@@ -347,6 +348,9 @@ def main():
         write_run_summary(lake, run_id, args.years, summary, spark)
         print_summary(spark)
         write_report(spark, summary["reconcile"], args.years)   # the result on the GitHub run page
+        add_to_summary("**Silver INMET tables** (click a table to see its first rows)")
+        show_tables(spark, ["silver.inmet_hourly", "silver.inmet_quarantine",
+                            "silver.quality_report", *STATION_TABLES], args.years)
         return 0
     except Exception as error:
         print("SILVER FAILED:", error)
