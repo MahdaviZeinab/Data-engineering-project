@@ -43,10 +43,10 @@ def test_save_table_replaces_only_given_years(spark):
 
 
 def test_new_column_replaces_whole_table(spark):
-    # the old table has no "flag" column; saving one year with it must not crash
+    # the old table has no "flag" column; saving only one year with it must stop
     rows = spark.createDataFrame([("old", 2020), ("old", 2021)], "run string, source_year int")
     save_table(spark, rows, "test_db.changed")
     new = spark.createDataFrame([("new", "x", 2021)], "run string, flag string, source_year int")
-    save_table(spark, new, "test_db.changed", years=[2021])
-    result = [(r.run, r.flag, r.source_year) for r in spark.table("test_db.changed").collect()]
-    assert result == [("new", "x", 2021)]
+    with pytest.raises(ValueError):                  # only 2021 would delete 2020: stop
+        save_table(spark, new, "test_db.changed", years=[2021])
+    assert spark.table("test_db.changed").count() == 2   # 2020 and 2021 are still there
