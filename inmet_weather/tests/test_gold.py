@@ -113,7 +113,7 @@ def test_risk_score_adds_the_bad_factors(spark):
 def save_silver(spark, weather_rows, fire_rows):
     spark.sql("CREATE DATABASE IF NOT EXISTS silver")
     weather(spark, weather_rows).write.saveAsTable("silver.inmet_hourly")
-    fires(spark, fire_rows).write.saveAsTable("silver.fire_foci")
+    fires(spark, fire_rows).write.saveAsTable("silver.fires")
 
 
 def test_gold_saves_daily_table_and_probability(spark):

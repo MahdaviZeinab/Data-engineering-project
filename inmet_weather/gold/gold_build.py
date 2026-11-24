@@ -3,7 +3,7 @@ Gold layer: how likely is a fire in a state on a day with bad fire weather?
 
 It joins the two Silver tables per state and local day:
   silver.inmet_hourly (weather, one row per station and hour)
-  silver.fire_foci    (fires, one row per fire focus)
+  silver.fires        (clean fires, one row per fire focus)
 
 Steps:
   1. weather: hours -> one row per station and day -> one row per state and day
@@ -33,6 +33,7 @@ from pyspark.sql import functions as F
 from pyspark.sql.window import Window
 
 from common.checks import has_columns, not_empty, one_row_per, run_checks
+from common.report import add_to_summary, markdown_table, report_failure
 from common.spark import save_table, start_spark
 from gold import gold_contract as rules
 
@@ -47,7 +48,7 @@ def read_silver(spark, years=None):
     # the first UTC hours of 1 January are still 31 December in Brazil, and
     # would otherwise put a few rows of the year before into this year's run.
     weather = spark.table("silver.inmet_hourly")
-    fires = spark.table("silver.fire_foci")
+    fires = spark.table("silver.fires")
     if years:
         weather = weather.where(F.col("source_year").isin(years))
         fires = fires.where(F.col("source_year").isin(years))
@@ -187,6 +188,21 @@ def print_summary(spark):
           .orderBy("risk_score").show())
 
 
+def write_report(spark, years=None):
+    # The Gold result per year on the GitHub run page (see common/report.py).
+    daily = spark.table(rules.DAILY)
+    if years:
+        daily = daily.where(F.col("source_year").isin(years))
+    rows = (daily.groupBy("source_year").agg(
+                F.count("*").alias("state_days"),
+                F.sum(F.col("weather_ok").cast("int")).alias("with_weather"),
+                F.sum(F.col("has_fire").cast("int")).alias("with_fire"),
+                F.sum("fires").alias("fires"))
+            .orderBy("source_year").collect())
+    add_to_summary("### Gold\n\n" + markdown_table(
+        ["year", "state-days", "with weather", "with fire", "fires"], [tuple(r) for r in rows]))
+
+
 def main():
     # Read the command line options, start Spark, build Gold and save it.
     parser = argparse.ArgumentParser(description="Build the Gold fire-risk tables from Silver.")
@@ -203,9 +219,11 @@ def main():
         save_gold(spark, daily, args.years)
         print(f"GOLD: saved {rules.DAILY} and {rules.PROBABILITY}")
         print_summary(spark)
+        write_report(spark, args.years)        # the result on the GitHub run page
         return 0
     except Exception as error:
         print("GOLD FAILED:", error)
+        report_failure("Gold", error)
         return 1
     finally:
         spark.stop()
