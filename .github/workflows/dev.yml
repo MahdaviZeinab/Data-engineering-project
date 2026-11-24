@@ -1,16 +1,7 @@
 # DEV pipeline on the OpenStack VM (self-hosted runner).
-#
-# When does it run?
-#   - automatically after every push to any branch EXCEPT main
-#   - by hand: Actions tab -> "Dev Pipeline" -> Run workflow
-#
-# What is different from prod?
-#   - small data: only 2025, so a run is fast
-#   - writes ONLY to /data/inmet/lake/dev (prod data is never touched)
-#   - no approval needed (GitHub Environment "dev" has no rules)
-#
 # Order: job "bronze" (tests -> download -> Bronze tables)
-#        -> job "silver" (Silver tables), only if Bronze worked.
+#        -> job "silver" (Silver tables), only if Bronze worked
+#        -> job "gold"   (Gold tables + fire model), only if Silver worked.
 name: Dev Pipeline
 
 on:
@@ -118,15 +109,51 @@ jobs:
           DAT535_OUTPUT_DIR: ${{ env.DATA_ROOT }}/lake/${{ env.LAKE_ENV }}
         run: $DATA_ROOT/venv/bin/python -m silver.fire_build --env "$LAKE_ENV" --years $YEARS
 
-      - name: Write run summary
-        if: always()
+      - name: Write Silver summary
+        if: always()                # also when a Silver step failed (then Gold is skipped)
         run: |
-          echo "## Dev pipeline run" >> $GITHUB_STEP_SUMMARY
+          echo "## Dev pipeline run: Silver" >> $GITHUB_STEP_SUMMARY
           echo "| Key | Value |" >> $GITHUB_STEP_SUMMARY
           echo "|-----|-------|" >> $GITHUB_STEP_SUMMARY
           echo "| Run # | ${{ github.run_number }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Environment | $LAKE_ENV |" >> $GITHUB_STEP_SUMMARY
           echo "| Years | $YEARS |" >> $GITHUB_STEP_SUMMARY
+          echo "| Branch | ${{ github.ref_name }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Commit | ${{ github.sha }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Triggered by | ${{ github.actor }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Result | ${{ job.status }} |" >> $GITHUB_STEP_SUMMARY
+
+  gold:
+    needs: silver                   # starts only when Silver worked, same commit
+    runs-on: [self-hosted, linux, openstack]
+    environment: dev
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: inmet_weather
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build Gold (fire risk)
+        env:
+          DAT535_OUTPUT_DIR: ${{ env.DATA_ROOT }}/lake/${{ env.LAKE_ENV }}
+        run: $DATA_ROOT/venv/bin/python -m gold.gold_build --env "$LAKE_ENV" --years $YEARS
+
+      - name: Train fire model (logistic regression)
+        env:
+          DAT535_OUTPUT_DIR: ${{ env.DATA_ROOT }}/lake/${{ env.LAKE_ENV }}
+        run: $DATA_ROOT/venv/bin/python -m ml.train_fire_model --env "$LAKE_ENV" --valid-from 2025-07-01 --test-from 2025-09-01
+
+      - name: Write Gold summary
+        if: always()
+        run: |
+          echo "## Dev pipeline run: Gold" >> $GITHUB_STEP_SUMMARY
+          echo "| Key | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Run # | ${{ github.run_number }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Environment | $LAKE_ENV |" >> $GITHUB_STEP_SUMMARY
+          echo "| Years | $YEARS |" >> $GITHUB_STEP_SUMMARY
+          echo "| Model split | train < 2025-07-01 <= validation < 2025-09-01 <= test |" >> $GITHUB_STEP_SUMMARY
           echo "| Branch | ${{ github.ref_name }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Commit | ${{ github.sha }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Triggered by | ${{ github.actor }} |" >> $GITHUB_STEP_SUMMARY

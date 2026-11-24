@@ -35,6 +35,8 @@ from pyspark.sql.window import Window
 
 from common.checks import has_columns, not_empty, run_checks
 from bronze.bronze_ingest import check_tables_match
+from common.report import (add_to_summary, check_invalid_share, markdown_table, percent,
+                           report_failure, show_tables)
 from common.spark import move_all_from_staging, save_to_staging, start_spark
 from silver import contract
 from silver.quality import check_silver, checksum, quality_report, reconcile, rows_per_year
@@ -294,6 +296,32 @@ def print_summary(spark):
           .show(10, truncate=False)
 
 
+def write_report(spark, counts, years=None):
+    # The Silver result per year on the GitHub run page (see common/report.py).
+    # invalid % = rows moved to quarantine / rows read from Bronze.
+    # Removed duplicates are shown on their own: they are not bad data, only repeated.
+    rows = []
+    for year, c in sorted(counts.items()):
+        invalid_pct = percent(c["bad_rows_moved_to_quarantine"], c["rows_read_from_bronze"])
+        status = check_invalid_share("Silver INMET", "silver.inmet_hourly", year, invalid_pct)
+        rows.append((year, c["rows_read_from_bronze"], c["good_rows_saved_in_silver"],
+                     c["bad_rows_moved_to_quarantine"], c["duplicate_rows_removed"],
+                     invalid_pct, status))
+    text = "### Silver INMET\n\n" + markdown_table(
+        ["year", "rows from Bronze", "good rows", "quarantined", "duplicates removed",
+         "invalid %", "status"], rows)
+
+    quarantine = spark.table("silver.inmet_quarantine")
+    if years:
+        quarantine = quarantine.where(F.col("source_year").isin(years))
+    reasons = (quarantine.groupBy("source_year", "dq_issue").count()
+               .orderBy("source_year", F.desc("count")).collect())
+    if reasons:
+        text += "\n\nQuarantined rows by reason:\n\n" + markdown_table(
+            ["year", "reason", "rows"], [tuple(r) for r in reasons])
+    add_to_summary(text)
+
+
 def main():
     # Read the command line options, start Spark, clean the data and save it.
     parser = argparse.ArgumentParser(description="Build the Silver tables from Bronze.")
@@ -319,9 +347,14 @@ def main():
         spark.table("silver.quality_report").show(truncate=False)
         write_run_summary(lake, run_id, args.years, summary, spark)
         print_summary(spark)
+        write_report(spark, summary["reconcile"], args.years)   # the result on the GitHub run page
+        add_to_summary("**Silver INMET tables** (click a table to see its first rows)")
+        show_tables(spark, ["silver.inmet_hourly", "silver.inmet_quarantine",
+                            "silver.quality_report", *STATION_TABLES], args.years)
         return 0
     except Exception as error:
         print("SILVER FAILED:", error)
+        report_failure("Silver INMET", error)
         return 1
     finally:
         spark.stop()
