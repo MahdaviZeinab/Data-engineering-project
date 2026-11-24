@@ -169,11 +169,15 @@ def make_files_table(files, hourly, quarantine):
 
 
 def add_status(table):
+    # The hours of a file are compared with the dates in its name:
+    #   LESS_HOURS_THAN_EXPECTED = hours are missing (the station did not send them)
+    #   MORE_HOURS_THAN_EXPECTED = more hours than the name says (an old file name)
     # COMPLETE_WITH_ISSUES = duplicate hours or some bad lines
     has_issues = ((F.col("received_rows") != F.col("received_hours"))
                   | (F.col("quarantined_lines") > 0))
     status = (F.when(~F.col("header_ok"), "QUARANTINED")
-               .when(F.col("missing_hours") != 0, "INCOMPLETE")
+               .when(F.col("missing_hours") > 0, "LESS_HOURS_THAN_EXPECTED")
+               .when(F.col("missing_hours") < 0, "MORE_HOURS_THAN_EXPECTED")
                .when(has_issues, "COMPLETE_WITH_ISSUES")
                .otherwise("COMPLETE"))
     return table.withColumn("status", status)

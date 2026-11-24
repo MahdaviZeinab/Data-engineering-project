@@ -72,7 +72,7 @@ If `DAT535_OUTPUT_DIR` is set (as in the course lab CI), the output goes there.
 | Spark table | One row per | Content |
 |---|---|---|
 | `bronze.inmet_hourly` | station-hour | the 19 values as text (as INMET wrote them), source file, line number, `_bronze_*` columns |
-| `bronze.inmet_files` | source file | station info (lines 1-8), header check, expected / received / missing hours, `status` (COMPLETE, COMPLETE_WITH_ISSUES, INCOMPLETE, QUARANTINED) |
+| `bronze.inmet_files` | source file | station info (lines 1-8), header check, expected / received / missing hours, `status` (COMPLETE, COMPLETE_WITH_ISSUES, LESS_HOURS_THAN_EXPECTED, MORE_HOURS_THAN_EXPECTED, QUARANTINED) |
 | `bronze.inmet_quarantine` | bad line | the raw line and the problem |
 | `bronze.runs` | run | when it ran, which years, how many files and rows |
 

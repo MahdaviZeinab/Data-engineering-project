@@ -8,7 +8,7 @@ import pytest
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 
-from bronze.bronze_ingest import EXPECTED_HEADER, check_tables_match, run_bronze
+from bronze.bronze_ingest import EXPECTED_HEADER, add_status, check_tables_match, run_bronze
 from common.spark import save_table
 
 HOURLY = "bronze.inmet_hourly"
@@ -148,7 +148,19 @@ def test_loading_one_year_keeps_the_other_years(spark, source):
 def test_every_file_gets_a_status(spark, source):
     run_bronze(spark, source)
     status = {code: r["status"] for code, r in files_by_station(spark).items()}
-    assert status == {"A001": "COMPLETE", "A002": "INCOMPLETE", "A003": "QUARANTINED"}
+    assert status == {"A001": "COMPLETE", "A002": "LESS_HOURS_THAN_EXPECTED", "A003": "QUARANTINED"}
+
+
+def test_status_says_if_hours_are_missing_or_extra(spark):
+    # missing_hours > 0: fewer hours than the file name says; < 0: more hours
+    files = spark.createDataFrame(
+        [("less", True, 24, 0, 24, 24), ("more", True, -1728, 0, 3672, 3672),
+         ("ok", True, 0, 0, 24, 24)],
+        "name string, header_ok boolean, missing_hours int, quarantined_lines int, "
+        "received_rows int, received_hours int")
+    status = {r["name"]: r["status"] for r in add_status(files).collect()}
+    assert status == {"less": "LESS_HOURS_THAN_EXPECTED", "more": "MORE_HOURS_THAN_EXPECTED",
+                      "ok": "COMPLETE"}
 
 
 def test_every_run_is_in_the_runs_table(spark, source):
