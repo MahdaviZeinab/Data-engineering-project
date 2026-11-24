@@ -40,6 +40,7 @@ from common.spark import move_all_from_staging, save_to_staging, start_spark
 from silver import contract, fire_contract
 from silver.fire_events import add_fire_events
 from silver.nearest_station import add_nearest_station, mark_no_station
+from silver.quality import reconcile, rows_per_year
 from silver.state_check import inside_state
 
 TABLE = "silver.fires"
@@ -160,7 +161,10 @@ def run_fire_silver(spark, years=None, run_id=None, stations=None):
     # so we keep the tables we use more than once (spark.stop() frees them).
     df = mark_problems(df).cache()             # counted twice, then cleaned
     print("FIRE SILVER: double rows removed:", count_duplicates(df))
+    rows_in = rows_per_year(df)                # Bronze rows per year
     df = remove_duplicates(df)
+    rows_kept = rows_per_year(df)
+    duplicates = {year: rows_in[year] - rows_kept.get(year, 0) for year in rows_in}
     fires, quarantine = split_quarantine(df)
     if stations is None:
         stations = spark.table("silver.station_history")
@@ -168,8 +172,13 @@ def run_fire_silver(spark, years=None, run_id=None, stations=None):
     fires = add_fire_events(fires)
     run = F.lit(run_id)
     # cache(): both are checked, then saved
-    return (fires.withColumn("_silver_run_id", run).cache(),
-            quarantine.withColumn("_silver_run_id", run).cache())
+    fires = fires.withColumn("_silver_run_id", run).cache()
+    quarantine = quarantine.withColumn("_silver_run_id", run).cache()
+    # No row is lost: Bronze rows = fires + quarantine + double rows, every year.
+    # If a year does not add up, the job stops here, so nothing is saved.
+    counts = reconcile(rows_in, rows_per_year(fires), rows_per_year(quarantine), duplicates)
+    print("FIRE SILVER: reconcile ok:", counts)
+    return fires, quarantine
 
 
 def save_fire_silver(spark, fires, quarantine, years=None):
