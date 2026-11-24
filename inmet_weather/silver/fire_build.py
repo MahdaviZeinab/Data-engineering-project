@@ -204,7 +204,7 @@ def print_summary(spark, years=None):
     quarantine.groupBy("dq_issue").count().show()
 
 
-def rows_per_year(spark, table, years=None):
+def saved_rows_per_year(spark, table, years=None):
     # {year: rows} of a saved table, only the years we ran
     df = spark.table(table)
     if years:
@@ -216,9 +216,9 @@ def write_report(spark, years=None):
     # The fire Silver result per year on the GitHub run page (see common/report.py).
     # invalid % = rows moved to quarantine / rows read from Bronze;
     # duplicates = the rest (rows from Bronze - good rows - quarantined rows).
-    bronze = rows_per_year(spark, "bronze.fire_foci", years)
-    good = rows_per_year(spark, TABLE, years)
-    bad = rows_per_year(spark, QUARANTINE, years)
+    bronze = saved_rows_per_year(spark, "bronze.fire_foci", years)
+    good = saved_rows_per_year(spark, TABLE, years)
+    bad = saved_rows_per_year(spark, QUARANTINE, years)
     rows = []
     for year in sorted(bronze):
         duplicates = bronze[year] - good.get(year, 0) - bad.get(year, 0)
