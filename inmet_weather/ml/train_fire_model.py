@@ -41,6 +41,7 @@ from pyspark.sql import functions as F
 from pyspark.sql.types import DoubleType
 from pyspark.sql.window import Window
 
+from common.report import add_to_summary, markdown_table, report_failure
 from common.spark import save_table, start_spark
 
 DAILY = "gold.fire_weather_daily"
@@ -237,6 +238,18 @@ def save_results(spark, lake, fitted, metrics, predictions, weights):
     return path
 
 
+def write_report(metrics):
+    # The model scores on the GitHub run page (see common/report.py).
+    def short(value):
+        return "-" if value is None else round(value, 3)
+    rows = [(r["data_set"], r["rows"], r["high_fire_days"], short(r["auc"]), r["threshold"],
+             short(r["precision"]), short(r["recall"]), short(r["f1"]), short(r["rule_f1"]))
+            for r in metrics.collect()]
+    add_to_summary("### Fire model (logistic regression)\n\n" + markdown_table(
+        ["data set", "rows", "high-fire days", "AUC", "threshold", "precision", "recall", "F1",
+         "rule F1 (risk_score >= 4)"], rows))
+
+
 def main():
     # Read the command line options, start Spark, train, evaluate and save.
     parser = argparse.ArgumentParser(description="Train a logistic regression for high-fire days.")
@@ -257,9 +270,11 @@ def main():
         print("ML: strongest features (odds ratio > 1 raises the risk, < 1 lowers it)")
         weights.orderBy(F.abs("weight").desc()).show(12, truncate=False)
         print("ML: model saved in", path)
+        write_report(metrics)                  # the scores on the GitHub run page
         return 0
     except Exception as error:
         print("ML FAILED:", error)
+        report_failure("Fire model", error)
         return 1
     finally:
         spark.stop()

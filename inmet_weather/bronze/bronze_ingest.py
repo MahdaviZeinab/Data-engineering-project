@@ -7,6 +7,7 @@ from pathlib import Path
 
 from pyspark.sql import functions as F
 
+from common.report import add_to_summary, check_invalid_share, markdown_table, percent, report_failure
 from common.spark import move_all_from_staging, save_to_staging, start_spark
 
 
@@ -309,6 +310,37 @@ def print_summary(spark, years):
             .show(20, truncate=False)
 
 
+def write_report(spark, years):
+    # The Bronze result per year on the GitHub run page (see common/report.py):
+    # files, bad lines and their share, and the files that need a look.
+    files = spark.table(f"{DATABASE}.inmet_files").where(F.col("source_year").isin(years))
+    per_year = (files.groupBy("source_year").agg(
+                    F.count("*").alias("files"),
+                    F.sum((F.col("status") == "COMPLETE").cast("int")).alias("complete"),
+                    F.sum((F.col("status") != "COMPLETE").cast("int")).alias("with_problems"),
+                    F.sum("received_rows").alias("rows"),
+                    F.sum("quarantined_lines").alias("bad_lines"))
+                .orderBy("source_year").collect())
+    rows = []
+    for r in per_year:
+        bad_pct = percent(r["bad_lines"], r["rows"] + r["bad_lines"])
+        status = check_invalid_share("Bronze INMET", "bronze.inmet_hourly", r["source_year"], bad_pct)
+        rows.append((r["source_year"], r["files"], r["complete"], r["with_problems"],
+                     r["rows"], r["bad_lines"], bad_pct, status))
+    text = "### Bronze INMET\n\n" + markdown_table(
+        ["year", "files", "complete", "with problems", "rows", "bad lines", "bad %", "status"], rows)
+
+    problems = (files.where(F.col("status") != "COMPLETE")
+                .select("source_year",
+                        F.element_at(F.split("source_file", "/"), -1).alias("file"),
+                        "status", "missing_hours", "quarantined_lines")
+                .orderBy("source_year", "file").limit(20).collect())
+    if problems:
+        text += "\n\nFiles that are not COMPLETE (first 20):\n\n" + markdown_table(
+            ["year", "file", "status", "missing hours", "bad lines"], [tuple(p) for p in problems])
+    add_to_summary(text)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Load INMET CSV files into the Bronze tables.")
     project = Path(__file__).resolve().parents[1]          # the inmet_weather folder
@@ -322,10 +354,14 @@ def main():
 
     spark = start_spark("inmet-bronze", lake)
     try:
-        run_bronze(spark, os.path.abspath(args.source), args.years)
+        source = os.path.abspath(args.source)
+        years = args.years or find_years(source)
+        run_bronze(spark, source, years)
+        write_report(spark, years)             # the result on the GitHub run page
         return 0
     except Exception as error:
         print("BRONZE FAILED:", error)
+        report_failure("Bronze INMET", error)
         return 1
     finally:
         spark.stop()

@@ -36,6 +36,7 @@ from pyspark.sql.window import Window
 from bronze.fire_ingest import FIRE_TABLES
 from bronze.bronze_ingest import check_tables_match
 from common.checks import has_columns, not_empty, one_row_per, run_checks
+from common.report import add_to_summary, check_invalid_share, markdown_table, percent, report_failure
 from common.spark import move_all_from_staging, save_to_staging, start_spark
 from silver import contract, fire_contract
 from silver.fire_events import add_fire_events
@@ -202,6 +203,43 @@ def print_summary(spark, years=None):
     quarantine.groupBy("dq_issue").count().show()
 
 
+def rows_per_year(spark, table, years=None):
+    # {year: rows} of a saved table, only the years we ran
+    df = spark.table(table)
+    if years:
+        df = df.where(F.col("source_year").isin(years))
+    return {int(r["source_year"]): r["count"] for r in df.groupBy("source_year").count().collect()}
+
+
+def write_report(spark, years=None):
+    # The fire Silver result per year on the GitHub run page (see common/report.py).
+    # invalid % = rows moved to quarantine / rows read from Bronze;
+    # duplicates = the rest (rows from Bronze - good rows - quarantined rows).
+    bronze = rows_per_year(spark, "bronze.fire_foci", years)
+    good = rows_per_year(spark, TABLE, years)
+    bad = rows_per_year(spark, QUARANTINE, years)
+    rows = []
+    for year in sorted(bronze):
+        duplicates = bronze[year] - good.get(year, 0) - bad.get(year, 0)
+        invalid_pct = percent(bad.get(year, 0), bronze[year])
+        status = check_invalid_share("Silver fire", TABLE, year, invalid_pct)
+        rows.append((year, bronze[year], good.get(year, 0), bad.get(year, 0), duplicates,
+                     invalid_pct, status))
+    text = "### Silver fire\n\n" + markdown_table(
+        ["year", "rows from Bronze", "good rows", "quarantined", "duplicates removed",
+         "invalid %", "status"], rows)
+
+    quarantine = spark.table(QUARANTINE)
+    if years:
+        quarantine = quarantine.where(F.col("source_year").isin(years))
+    reasons = (quarantine.groupBy("source_year", "dq_issue").count()
+               .orderBy("source_year", F.desc("count")).collect())
+    if reasons:
+        text += "\n\nQuarantined rows by reason:\n\n" + markdown_table(
+            ["year", "reason", "rows"], [tuple(r) for r in reasons])
+    add_to_summary(text)
+
+
 def main():
     # Read the command line options, start Spark, clean the data and save it.
     parser = argparse.ArgumentParser(description="Build silver.fires from Bronze.")
@@ -219,9 +257,11 @@ def main():
         save_fire_silver(spark, fires, quarantine, args.years)
         print(f"FIRE SILVER: saved {TABLE} and {QUARANTINE}")
         print_summary(spark, args.years)
+        write_report(spark, args.years)        # the result on the GitHub run page
         return 0
     except Exception as error:
         print("FIRE SILVER FAILED:", error)
+        report_failure("Silver fire", error)
         return 1
     finally:
         spark.stop()

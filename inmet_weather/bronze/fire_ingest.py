@@ -7,6 +7,7 @@ from pathlib import Path
 from pyspark.sql import functions as F
 
 from bronze.bronze_ingest import add_load_info, check_tables_match, find_years, read_files
+from common.report import add_to_summary, check_invalid_share, markdown_table, percent, report_failure
 from common.spark import move_all_from_staging, save_to_staging, start_spark
 
 
@@ -182,6 +183,20 @@ def print_summary(spark, years):
          .orderBy("source_year").show(truncate=False)
 
 
+def write_report(spark, years):
+    # The fire Bronze result per year on the GitHub run page (see common/report.py).
+    files = spark.table(f"{DATABASE}.fire_files").where(F.col("source_year").isin(years))
+    rows = []
+    for r in files.orderBy("source_year").collect():
+        bad_pct = percent(r["quarantined_lines"], r["received_rows"] + r["quarantined_lines"])
+        status = check_invalid_share("Bronze fire", "bronze.fire_foci", r["source_year"], bad_pct)
+        rows.append((r["source_year"], r["source_file"].split("/")[-1], r["status"],
+                     r["received_rows"], r["received_foci"], r["quarantined_lines"], bad_pct, status))
+    add_to_summary("### Bronze fire\n\n" + markdown_table(
+        ["year", "file", "file status", "rows", "different fires", "bad lines", "bad %", "status"],
+        rows))
+
+
 def main():
     parser = argparse.ArgumentParser(description="Load INPE fire CSV files into Bronze tables.")
     project = Path(__file__).resolve().parents[1]          # the inmet_weather folder
@@ -195,10 +210,14 @@ def main():
 
     spark = start_spark("fire-bronze", lake)
     try:
-        run_fire_bronze(spark, os.path.abspath(args.source), args.years)
+        source = os.path.abspath(args.source)
+        years = args.years or find_years(source, folder="fire")
+        run_fire_bronze(spark, source, years)
+        write_report(spark, years)             # the result on the GitHub run page
         return 0
     except Exception as error:
         print("FIRE BRONZE FAILED:", error)
+        report_failure("Bronze fire", error)
         return 1
     finally:
         spark.stop()
