@@ -74,7 +74,6 @@ def test_same_name_different_content_stops_the_year(raw):
     assert not (raw / "2020" / "inmet").exists()   # nothing for Bronze to read by mistake
 
 
-
 def test_zip_without_csv_fails(raw):
     make_zip(raw, 2020, {"readme.txt": "x"})
     assert not injection.land(2020)
@@ -91,4 +90,4 @@ def test_corrupt_zip_fails_and_is_deleted(raw):
 
     assert not injection.land(2020)      # no crash
     assert not (raw / "2020.zip").exists()   # next run downloads it again
-    assert not (raw / "2020" / "inmet").exists()
+    assert not (raw / "2020" / "inmet").exists()

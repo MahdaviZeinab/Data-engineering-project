@@ -1,29 +1,25 @@
 """
-Silver 9: put aside the rows we can not use.
+Move unusable INMET rows to silver.inmet_quarantine.
 
-Every row gets ONE reason in the column dq_issue, or no reason (= a good row).
-We check the reasons in this order and take the first one that is true:
+Each row gets the first matching reason in dq_issue (null = good row):
 
-  bad_timestamp      the date or the hour is wrong, so we don't know when it was measured
-  unknown_station    the station is not in bronze.inmet_files (no name, state, place)
-  unknown_timezone   the station's state has no time zone, so no local day
-  not_in_brazil      the station is outside Brazil (good data, but not for our question)
-  all_values_empty   all 17 measurements are empty, so the row has nothing to use
+  bad_timestamp      date or hour can't be parsed
+  unknown_station    station not in bronze.inmet_files
+  unknown_timezone   no time zone for the station's state
+  not_in_brazil      station coordinates outside Brazil
+  all_values_empty   all 17 measurements are null
 
-Good rows go to silver.inmet_hourly, the other rows to silver.inmet_quarantine.
-Nothing is thrown away, so later we can check:
-  Bronze rows = good rows + quarantined rows + removed duplicates   (Silver 10)
+Nothing is dropped: Bronze rows = good + quarantined + removed duplicates.
 """
 
 from pyspark.sql import functions as F
 
-from silver import contract
-from silver.stations import to_number
+from silver import inmet_contract as contract
+from silver.inmet_stations import to_number
 
 
 def station_info(files):
-    # One row per station and year, from bronze.inmet_files:
-    # we know this station (known_station) and is it inside Brazil (in_brazil)?
+    # one row per station-year: known_station and in_brazil
     lat_min, lat_max = contract.BRAZIL_BOX["lat"]
     lon_min, lon_max = contract.BRAZIL_BOX["lon"]
     inside = (to_number("latitude").between(lat_min, lat_max)
@@ -35,7 +31,6 @@ def station_info(files):
 
 
 def find_reason(df):
-    # The reason why we can't use this row (the first one that is true), or null.
     all_empty = F.lit(True)
     for column in contract.MEASUREMENTS:
         all_empty = all_empty & F.col(column).isNull()
@@ -48,7 +43,7 @@ def find_reason(df):
 
 
 def quarantine_rows(df, files):
-    # Split the rows in two: (good rows, quarantined rows with their reason).
+    # returns (good rows, quarantined rows)
     df = df.join(F.broadcast(station_info(files)), ["station_code", "source_year"], "left")
     df = df.withColumn("known_station", F.coalesce("known_station", F.lit(False)))
     df = df.withColumn("dq_issue", find_reason(df)).drop("known_station", "in_brazil")
@@ -59,6 +54,5 @@ def quarantine_rows(df, files):
 
 
 def count_reasons(quarantined):
-    # How many rows per year and reason. Used in the run log and the quality report (S11).
     return (quarantined.groupBy("source_year", "dq_issue").count()
                        .orderBy("source_year", "dq_issue"))

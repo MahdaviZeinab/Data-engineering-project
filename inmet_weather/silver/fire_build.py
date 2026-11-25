@@ -1,27 +1,23 @@
 """
-Silver layer for the fire data: turn bronze.fire_foci into clean fire foci.
+Silver job for the INPE fire data: bronze.fire_foci -> silver.fires.
 
 Steps:
-  1. read bronze.fire_foci and check it has the columns we expect
-  2. clean the text and turn it into numbers and a time ("  -3.650000 " -> -3.65)
-  3. add the state code (UF) and the local time, so fires can be joined
-     with the weather data (same UF codes, same time zones)
-  4. mark rows with a problem in dq_issue, also a point outside its state
-     (silver/state_check.py)
-  5. remove double rows (same foco_id)
-  6. move rows with a problem to silver.fire_quarantine
-  7. add the nearest weather station (silver/nearest_station.py)
-  8. merge points of the same fire into one fire event (silver/fire_events.py)
-  9. save silver.fires and silver.fire_quarantine together (split by year)
+  1. read Bronze and check its columns
+  2. text -> numbers and timestamp
+  3. add state code (UF) and local time, to match the weather data
+  4. mark problem rows in dq_issue (incl. fire_state_check.py)
+  5. remove duplicate foco_ids
+  6. move problem rows to silver.fire_quarantine
+  7. add the nearest weather station (fire_station_matching.py)
+  8. group nearby points into fire events (fire_events.py)
+  9. save silver.fires and silver.fire_quarantine together
 
-Run silver.stations first: step 7 reads silver.station_history.
+Needs silver.station_history, so run silver.inmet_stations first.
 
-All rules are in silver/fire_contract.py (fire only) and silver/contract.py (shared).
-
-Run (from the inmet_weather folder):
+Run from the inmet_weather folder:
   python -m silver.fire_build                   # all years, dev
-  python -m silver.fire_build --years 2025      # only 2025
-  python -m silver.fire_build --env prod        # production lake
+  python -m silver.fire_build --years 2025
+  python -m silver.fire_build --env prod
 """
 
 import argparse
@@ -39,20 +35,18 @@ from common.checks import has_columns, not_empty, one_row_per, run_checks
 from common.report import (add_to_summary, check_invalid_share, markdown_table, percent,
                            report_failure, show_tables)
 from common.spark import move_all_from_staging, save_to_staging, start_spark
-from silver import contract, fire_contract
+from silver import fire_contract, inmet_contract as contract
 from silver.fire_events import add_fire_events
-from silver.nearest_station import add_nearest_station, mark_no_station
+from silver.fire_station_matching import add_nearest_station, mark_no_station
 from silver.quality import reconcile, rows_per_year
-from silver.state_check import inside_state
+from silver.fire_state_check import inside_state
 
 TABLE = "silver.fires"
 QUARANTINE = "silver.fire_quarantine"
 
 
-# Step 1: read Bronze and check it
-# ---------------------------------------------------------------------------
+# read Bronze
 def read_bronze(spark, years=None):
-    # Read bronze.fire_foci. If years are given, keep only those years.
     foci = spark.table("bronze.fire_foci")
     if years:
         foci = foci.where(F.col("source_year").isin(years))
@@ -60,16 +54,14 @@ def read_bronze(spark, years=None):
     return foci
 
 
-# Step 2: text -> numbers and time
-# ---------------------------------------------------------------------------
+# text -> numbers and time
 def text(column):
-    # The Bronze text without the extra spaces. An empty text becomes null.
+    # trimmed text, empty -> null
     value = F.trim(F.col(column))
     return F.when(value != "", value)
 
 
 def cast_values(df):
-    # Give the columns English names and the right types.
     return df.select(
         text("foco_id").alias("foco_id"),
         text("id_bdq").cast("long").alias("id_bdq"),
@@ -84,36 +76,30 @@ def cast_values(df):
     )
 
 
-# Step 3: state code (UF) and local time
-# ---------------------------------------------------------------------------
+# state code and local time
 def states_table(spark):
-    # A small table: full state name -> UF code -> time zone.
-    # It has 27 rows, so Spark can send it to every worker (broadcast join).
+    # state name -> UF -> time zone (27 rows, broadcast)
     rows = [(name, uf, contract.STATE_TIMEZONE[uf])
             for name, uf in fire_contract.STATE_TO_UF.items()]
     return spark.createDataFrame(rows, "state_name string, state string, timezone string")
 
 
 def add_state_and_time(spark, df):
-    # Add the UF code (the same code the weather data uses) and the local time.
-    # Fires are seen in the early afternoon, so the local day is the day of the fire.
     df = df.join(F.broadcast(states_table(spark)), "state_name", "left")
     df = df.withColumn("local_time", F.from_utc_timestamp("observed_at_utc", F.col("timezone")))
     df = df.withColumn("local_date", F.to_date("local_time"))
     return df.withColumn("local_hour", F.hour("local_time"))
 
 
-# Step 4: problems
-# ---------------------------------------------------------------------------
+# problems
 def inside_brazil():
-    # True when lat and lon are inside the box around Brazil (same box as the stations).
+    # same box as used for the stations
     box = contract.BRAZIL_BOX
     return (F.col("lat").between(*box["lat"]) & F.col("lon").between(*box["lon"]))
 
 
 def mark_problems(df):
-    # dq_issue = the first problem of the row, or null when the row is fine.
-    # Rows with a problem go to silver.fire_quarantine (step 6).
+    # dq_issue = first problem found, null if the row is fine
     problem = (F.when(F.col("foco_id").isNull(), "missing_id")
                 .when(F.col("observed_at_utc").isNull(), "bad_timestamp")
                 .when(F.col("lat").isNull() | F.col("lon").isNull(), "bad_coordinates")
@@ -124,17 +110,15 @@ def mark_problems(df):
     return df.withColumn("dq_issue", problem)
 
 
-# Step 5: double rows
-# ---------------------------------------------------------------------------
+# duplicates
 def count_duplicates(df):
-    # Count the extra rows: rows with the same foco_id as another row.
     ids = df.where(F.col("foco_id").isNotNull()).select(fire_contract.KEY)
     return ids.count() - ids.distinct().count()
 
 
 def remove_duplicates(df):
-    # Keep one row per foco_id: the one loaded last, then the first line in the file
-    # (so two runs always keep the same row). Rows without an id are all kept.
+    # one row per foco_id: latest load, then first line in the file (stable across reruns).
+    # Rows without an id are kept.
     newest_first = (Window.partitionBy(*fire_contract.KEY)
                     .orderBy(F.col("_bronze_ingestion_time").desc(),
                              F.col("source_file").asc(), F.col("source_line_number").asc()))
@@ -143,27 +127,21 @@ def remove_duplicates(df):
     return df.where(keep).drop("rank", "_bronze_ingestion_time")
 
 
-# Step 6: quarantine
-# ---------------------------------------------------------------------------
+# quarantine
 def split_quarantine(df):
-    # Good rows (no problem) and quarantine rows (with a problem in dq_issue).
-    # Nothing is thrown away: every row ends up in one of the two tables.
+    # returns (good rows, quarantine rows)
     return df.where(F.col("dq_issue").isNull()), df.where(F.col("dq_issue").isNotNull())
 
 
-# The whole job
-# ---------------------------------------------------------------------------
+# job
 def run_fire_silver(spark, years=None, run_id=None, stations=None):
-    # Do all the steps and return (fires, quarantine), not saved yet.
-    # stations: the station table to use (tests give a small one).
+    # Returns (fires, quarantine), not saved yet. Tests can pass a small `stations` table.
     run_id = run_id or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     df = cast_values(read_bronze(spark, years))
     df = add_state_and_time(spark, df)
-    # cache(): Spark redoes every step for each count, check or save,
-    # so we keep the tables we use more than once (spark.stop() frees them).
-    df = mark_problems(df).cache()             # counted twice, then cleaned
+    df = mark_problems(df).cache()             # used for two counts
     print("FIRE SILVER: double rows removed:", count_duplicates(df))
-    rows_in = rows_per_year(df)                # Bronze rows per year
+    rows_in = rows_per_year(df)
     df = remove_duplicates(df)
     rows_kept = rows_per_year(df)
     duplicates = {year: rows_in[year] - rows_kept.get(year, 0) for year in rows_in}
@@ -173,20 +151,17 @@ def run_fire_silver(spark, years=None, run_id=None, stations=None):
     fires = mark_no_station(add_nearest_station(fires, stations))
     fires = add_fire_events(fires)
     run = F.lit(run_id)
-    # cache(): both are checked, then saved
     fires = fires.withColumn("_silver_run_id", run).cache()
     quarantine = quarantine.withColumn("_silver_run_id", run).cache()
-    # No row is lost: Bronze rows = fires + quarantine + double rows, every year.
-    # If a year does not add up, the job stops here, so nothing is saved.
+    # stops here (before saving) if Bronze rows != fires + quarantine + duplicates
     counts = reconcile(rows_in, rows_per_year(fires), rows_per_year(quarantine), duplicates)
     print("FIRE SILVER: reconcile ok:", counts)
     return fires, quarantine
 
 
 def save_fire_silver(spark, fires, quarantine, years=None):
-    # Check the tables, then save both together: first to "<name>_new",
-    # then into the real tables (if one fails, both get their old rows back).
-    # Only the years we ran are replaced.
+    # check, write to "<name>_new", then swap both tables together.
+    # Only the given years are replaced.
     run_checks(fires, [not_empty, has_columns("foco_id", "observed_at_utc", "state", "local_date"),
                        one_row_per(*fire_contract.KEY)])
     save_to_staging(spark, fires, TABLE)
@@ -195,7 +170,6 @@ def save_fire_silver(spark, fires, quarantine, years=None):
 
 
 def print_summary(spark, years=None):
-    # Print a short report in the log: rows per year, per problem, and a few rows.
     result = spark.table(TABLE)
     if years:
         result = result.where(F.col("source_year").isin(years))
@@ -214,7 +188,6 @@ def print_summary(spark, years=None):
 
 
 def saved_rows_per_year(spark, table, years=None):
-    # {year: rows} of a saved table, only the years we ran
     df = spark.table(table)
     if years:
         df = df.where(F.col("source_year").isin(years))
@@ -222,9 +195,8 @@ def saved_rows_per_year(spark, table, years=None):
 
 
 def write_report(spark, years=None):
-    # The fire Silver result per year on the GitHub run page (see common/report.py).
-    # invalid % = rows moved to quarantine / rows read from Bronze;
-    # duplicates = the rest (rows from Bronze - good rows - quarantined rows).
+    # Results table for the GitHub run page.
+    # invalid % = quarantined / Bronze rows; duplicates = Bronze - good - quarantined.
     bronze = saved_rows_per_year(spark, "bronze.fire_foci", years)
     good = saved_rows_per_year(spark, TABLE, years)
     bad = saved_rows_per_year(spark, QUARANTINE, years)
@@ -251,13 +223,12 @@ def write_report(spark, years=None):
 
 
 def main():
-    # Read the command line options, start Spark, clean the data and save it.
     parser = argparse.ArgumentParser(description="Build silver.fires from Bronze.")
     parser.add_argument("--env", default="dev", choices=["dev", "prod"])
     parser.add_argument("--years", type=int, nargs="*")
     args = parser.parse_args()
 
-    project = Path(__file__).resolve().parents[1]          # the inmet_weather folder
+    project = Path(__file__).resolve().parents[1]
     lake = os.environ.get("DAT535_OUTPUT_DIR") or str(project / "data" / "lake" / args.env)
 
     spark = start_spark("fire-silver", lake, memory="2g")
@@ -267,7 +238,7 @@ def main():
         save_fire_silver(spark, fires, quarantine, args.years)
         print(f"FIRE SILVER: saved {TABLE} and {QUARANTINE}")
         print_summary(spark, args.years)
-        write_report(spark, args.years)        # the result on the GitHub run page
+        write_report(spark, args.years)
         add_to_summary("**Silver fire tables** (click a table to see its first rows)")
         show_tables(spark, [TABLE, QUARANTINE], args.years)
         return 0

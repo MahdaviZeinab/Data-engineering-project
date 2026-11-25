@@ -55,9 +55,7 @@ def by_date(df):
     return {r["local_date"]: r for r in df.collect()}
 
 
-# ---------------------------------------------------------------------------
 # Step 1: weather per day
-# ---------------------------------------------------------------------------
 def test_rain_is_added_and_short_days_are_dropped(spark):
     d = date(2025, 9, 1)
     rows = day_of_weather("A1", "MT", d, rain=1.0) + day_of_weather("A2", "MT", d, hours=10)
@@ -73,9 +71,7 @@ def test_state_value_is_the_average_of_its_stations(spark):
     assert (row["stations"], row["temp_max_c"]) == (2, 32.0)
 
 
-# ---------------------------------------------------------------------------
 # Steps 2 and 3: join, dry spell, score
-# ---------------------------------------------------------------------------
 def test_join_keeps_days_without_fires_and_days_without_weather(spark):
     w = state_weather(station_days(weather(spark, day_of_weather("A1", "MT", date(2025, 9, 1)))))
     f = state_fires(fires(spark, [("f1", "MT", date(2025, 9, 2), 2025, None),
@@ -107,9 +103,7 @@ def test_risk_score_adds_the_bad_factors(spark):
     assert scores == {"MT": rules.MAX_SCORE, "PA": 2}   # PA: only the 31 dry days
 
 
-# ---------------------------------------------------------------------------
 # The whole job
-# ---------------------------------------------------------------------------
 def save_silver(spark, weather_rows, fire_rows):
     spark.sql("CREATE DATABASE IF NOT EXISTS silver")
     weather(spark, weather_rows).write.saveAsTable("silver.inmet_hourly")

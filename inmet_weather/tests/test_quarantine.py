@@ -3,8 +3,8 @@ import pytest
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 
-from silver.contract import MEASUREMENTS
-from silver.quarantine import count_reasons, quarantine_rows
+from silver.inmet_contract import MEASUREMENTS
+from silver.inmet_quarantine import count_reasons, quarantine_rows
 
 
 @pytest.fixture(scope="module")

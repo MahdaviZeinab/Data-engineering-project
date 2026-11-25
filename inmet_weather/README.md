@@ -1,136 +1,115 @@
-# INMET weather – medallion pipeline (DAT535)
+# INMET weather + fire pipeline (DAT535)
 
-Hourly weather data from INMET (Brazil), 2020–2025: about 3,470 station files, 2.2 GB.
-Second source: fire foci from INPE (Queimadas), one CSV per year (2020: 222,797 fire foci).
-Batch processing with Apache Spark and GitHub Actions.
+Weather (INMET) and fires (INPE) in Brazil, 2020–2025.
 
 ```
-INMET website ─► bronze/injection.py ─► data/raw/<year>/inmet/*.CSV ─► bronze/bronze_ingest.py ─► Spark tables bronze.*
-                                                     silver/ reads spark.table("bronze.inmet_hourly") ─► Spark tables silver.*
-                                                     gold/   (later)
-
-INPE website  ─► bronze/injection.py --source fire ─► data/raw/<year>/fire/*.csv ─► bronze/fire_ingest.py ─► bronze.fire_*
-                                                     silver/fire_build.py reads bronze.fire_foci ─► silver.fires
+download ─► Bronze (raw) ─► Silver (clean) ─► Gold (dashboard + ML)
 ```
 
-Each layer saves its result as **Spark tables** (`saveAsTable`, Parquet, split by year).
-The next layer reads them by name with `spark.table(...)`, not from a folder path.
-Every layer starts Spark and saves its tables with `common/spark.py`, so they all see the same tables.
+The ML model is built. The dashboard is not built yet, but its Gold tables are ready.
+
 
 ## Folders
 
 ```
 inmet_weather/
-├── bronze/                 Bronze layer: getting the data in
-│   ├── injection.py        download + unzip the yearly files (INMET, or INPE with --source fire)
-│   ├── bronze_ingest.py    Spark job: raw files -> Bronze Spark tables
-│   └── fire_ingest.py      Spark job: fire files -> bronze.fire_* tables (same strategy as INMET)
-├── common/
-│   ├── spark.py            start_spark() + save_table(): every layer uses the same Spark tables
-│   └── checks.py           small checks we run on a table before we save it
-├── silver/                 Silver layer (next step)
-├── gold/                   Gold layer (later)
-├── tests/                  tests for all layers
-├── data/                   NOT in Git (see .gitignore)
-│   ├── raw/<year>.zip      the original INMET zip   (raw/fire_<year>.zip: the INPE fire zip)
-│   ├── raw/<year>/inmet/   the original INMET CSV files
-│   ├── raw/<year>/fire/    the original INPE fire CSV file
-│   └── lake/<env>/         the output: warehouse/ (Spark tables) + metastore_db/ (table list)
-├── requirements.txt
-└── pytest.ini
+├── bronze/   download and load the raw files
+├── silver/   clean weather and fires
+├── gold/     dashboard and ML tables
+├── ml/       fire model
+├── common/   shared Spark helpers
+├── tests/
+└── data/     all data (not in Git)
 ```
 
-Code is in `bronze/`, `silver/` and `gold/`. Data is only in `data/`, so the code folders stay small,
-and Git never tries to save 2.2 GB of CSV files.
 
-## Set up once
+## Data
+
+All data is saved in the `data/` folder.
+
+The raw files go in `data/raw/`. The tables go in `data/lake/`.
+
+On the VM, this is `/data/inmet/`.
+
+
+## 1. Set up the VM
 
 ```bash
-cd inmet_weather
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt      # needs Java 8, 11 or 17
+./lab1_install-spark.sh          # install Spark (course script)
 ```
-
-## Run (from the inmet_weather folder)
 
 ```bash
-python bronze/injection.py                    # download + unzip (skips finished years)
-python -m bronze.bronze_ingest                # Bronze, all years, dev
-python -m bronze.bronze_ingest --years 2025   # only 2025 (other years are not touched)
-python -m bronze.bronze_ingest --env prod     # production folder
-python bronze/injection.py --source fire      # fire files: download + unzip
-python -m bronze.fire_ingest                  # fire Bronze (same --years / --env options)
-python -m silver.fire_build                   # fire Silver
-python -m pytest -q                           # tests
+sudo apt update
+sudo apt install -y openjdk-17-jre-headless python3-venv git
+sudo mkdir -p /data/inmet && sudo chown -R ubuntu:ubuntu /data
 ```
 
-If `DAT535_OUTPUT_DIR` is set (as in the course lab CI), the output goes there.
-
-## Bronze output
-
-| Spark table | One row per | Content |
-|---|---|---|
-| `bronze.inmet_hourly` | station-hour | the 19 values as text (as INMET wrote them), source file, line number, `_bronze_*` columns |
-| `bronze.inmet_files` | source file | station info (lines 1-8), header check, expected / received / missing hours, `status` (COMPLETE, COMPLETE_WITH_ISSUES, LESS_HOURS_THAN_EXPECTED, MORE_HOURS_THAN_EXPECTED, QUARANTINED) |
-| `bronze.inmet_quarantine` | bad line | the raw line and the problem |
-| `bronze.runs` | run | when it ran, which years, how many files and rows |
-
-Fire tables (from `bronze/fire_ingest.py`):
-
-| Spark table | One row per | Content |
-|---|---|---|
-| `bronze.fire_foci` | fire focus | the 9 INPE values as text (spaces too), source file, line number, `_bronze_*` columns |
-| `bronze.fire_files` | source file (= one year) | header check, received rows / different fire ids / bad lines, `status` (COMPLETE, COMPLETE_WITH_ISSUES, QUARANTINED) |
-| `bronze.fire_quarantine` | bad line | the raw line and the problem (wrong header, not 9 values) |
-| `bronze.fire_runs` | run | when it ran, which years, how many files and rows |
-
-INPE does not say how many fires a file should have, so there is no INCOMPLETE status for fires.
-
-All tables are Parquet, split by `source_year`. Loading one year again only replaces that year.
-Saving happens in two steps: first all new rows go to `<table>_new` tables and are checked,
-and only then do they replace the old years. If the job crashes or a check fails in step one,
-the old data is not touched.
-In step two the three tables change together: the old rows are first copied to `<table>_old`,
-and if replacing one table fails, the old rows are put back in all three.
-If the job is killed in the middle (e.g. the VM restarts), `check_tables_match` finds years where
-the tables hold different runs; then run Bronze again for those years.
-Column names are simple versions of the Portuguese names (Spark tables do not allow commas
-in column names); the values are not changed.
-
-Look at the tables:
-
-```python
-from common.spark import start_spark
-spark = start_spark("look", "data/lake/dev")
-spark.sql("SHOW TABLES IN bronze").show()
-spark.table("bronze.inmet_files").show()
+```bash
+git clone https://github.com/MahdaviZeinab/Data-engineering-project.git
+cd Data-engineering-project/inmet_weather
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+python -m pytest -q
 ```
 
-Note: the table list is kept in a small Derby database (`metastore_db/`), which allows only
-one Spark program at a time. Run Bronze, then Silver, not both at once.
-## GitHub Actions: dev and prod
 
-The workflows are in `.github/workflows/` at the repository root. Both run on our OpenStack VM
-(self-hosted runner, labels `self-hosted, linux, openstack`). Data is kept on the VM in `/data/inmet`.
+## 2. Connect the VM to GitHub
+
+1. Add a self-hosted runner (Settings → Actions → Runners) with the label `openstack`.
+
+2. Add the environments `dev` and `main` (with required reviewers).
+
+
+## 3. Run the pipeline
 
 | | Dev | Prod |
 |---|---|---|
-| Workflow | `dev.yml` | `prod.yml` |
-| Runs after | a push to any branch **except** `main` | a push to `main` (a merged Pull Request) |
-| GitHub Environment | `dev` (no rules) | `main` (**Required reviewers**) |
-| Years | 2025 only (fast) | all years 2020-2025 |
-| Writes to | `/data/inmet/lake/dev` | `/data/inmet/lake/prod` |
+| Starts on | push to any branch except `main` | push to `main` |
+| Years | 2025 | 2020–2025 |
+| Approval | no | yes |
 
-Each run has two jobs: `bronze` (tests, download, Bronze tables for weather and fires),
-then `silver` (Silver tables for weather and fires).
-`silver` starts only if `bronze` worked, so Silver always reads the Bronze tables of the same run.
+Push a branch: dev runs. Merge into `main`: prod runs after approval.
 
-Branch flow:
 
-1. Work on a feature branch and push. The dev pipeline runs and changes only `lake/dev`.
-2. Open a Pull Request into `main` and merge it when dev is green.
-3. The prod pipeline starts and **waits**. A reviewer opens the run in the Actions tab,
-   clicks **Review deployments**, then **Approve and deploy**.
+## Run without GitHub
 
-Raw files (`/data/inmet/raw`) and the Python environment (`/data/inmet/venv`) are shared by dev and prod.
+You can also run each step yourself on the VM.
+
+First go to the project folder:
+
+```bash
+cd inmet_weather
+```
+
+1. Bronze (download the weather and fire files, then load them):
+   ```bash
+   python bronze/injection.py
+   python bronze/injection.py --source fire
+   python -m bronze.bronze_ingest
+   python -m bronze.fire_ingest
+   ```
+
+2. Silver (clean the data):
+   ```bash
+   python -m silver.inmet_build
+   python -m silver.fire_build
+   ```
+
+3. Gold (make the dashboard tables):
+   ```bash
+   python -m gold.gold_build
+   python -m gold.state_month_risk
+   ```
+
+4. ML (train the fire model):
+   ```bash
+   python -m ml.train_fire_model --valid-from 2025-07-01 --test-from 2025-09-01
+   ```
+
+Run the steps in this order. Each step needs the one before it.
+
+To run only one year, add `--years 2025` at the end of each command, for example:
+
+```bash
+python -m bronze.bronze_ingest --years 2025
+```

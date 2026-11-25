@@ -41,7 +41,6 @@ KEY = ["state", "local_date"]
 
 
 # Step 0: read Silver
-# ---------------------------------------------------------------------------
 def read_silver(spark, years=None):
     # Read the two Silver tables. If years are given, keep only those years.
     # We keep only rows whose local day is in the same year as their file:
@@ -57,7 +56,6 @@ def read_silver(spark, years=None):
 
 
 # Step 1: weather per state and day
-# ---------------------------------------------------------------------------
 def station_days(weather):
     # One row per station and day. Rain is ADDED over the hours (it is a total),
     # the other values take the day's maximum or minimum.
@@ -84,7 +82,6 @@ def state_weather(days):
 
 
 # Step 2: fires per state and day
-# ---------------------------------------------------------------------------
 def state_fires(fires):
     # Number of fire foci per state and day. Rows with a quality problem are left out.
     clean = fires.where(F.col("dq_issue").isNull() & F.col("state").isNotNull())
@@ -92,7 +89,6 @@ def state_fires(fires):
 
 
 # Step 3: join, days without rain, risk score
-# ---------------------------------------------------------------------------
 def join_weather_and_fires(weather_days, fire_days):
     # Full join: a day with weather but no fire gets fires = 0,
     # a day with fires but no weather is kept with weather_ok = false.
@@ -133,7 +129,6 @@ def add_risk_score(daily):
 
 
 # Step 4: fire probability per risk score
-# ---------------------------------------------------------------------------
 def probability_by_score(daily):
     # For each state and risk score: how many days, how many had a fire,
     # and the share of days with a fire. "ALL" = all states together.
@@ -152,7 +147,6 @@ def probability_by_score(daily):
 
 
 # The whole job
-# ---------------------------------------------------------------------------
 def run_gold(spark, years=None, run_id=None):
     # Do steps 1-3 and return the daily table (not saved yet).
     run_id = run_id or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")

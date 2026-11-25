@@ -61,7 +61,6 @@ NUMBER_FEATURES = [
 
 
 # Step 1: features
-# ---------------------------------------------------------------------------
 def add_features(daily):
     # Add the weather of the days BEFORE today (only the past: no information from the future)
     # and the month. Only days with weather data are used.
@@ -77,7 +76,6 @@ def add_features(daily):
 
 
 # Step 2: target and split
-# ---------------------------------------------------------------------------
 def split_by_date(df, valid_from, test_from):
     # Train, validation and test, by date.
     train = df.where(F.col("local_date") < F.lit(valid_from).cast("date"))
@@ -108,7 +106,6 @@ def add_weights(train):
 
 
 # Step 3: the model
-# ---------------------------------------------------------------------------
 def make_pipeline():
     # state and month -> numbers -> one-hot; all features in one vector; scale; model.
     return Pipeline(stages=[
@@ -134,7 +131,6 @@ def add_probability(predictions):
 
 
 # Step 4: how good is it?
-# ---------------------------------------------------------------------------
 def scores(df, predicted):
     # Precision, recall and F1 of a 0/1 prediction column (as a Spark expression).
     row = df.select(
@@ -195,7 +191,6 @@ def feature_weights(spark, fitted):
 
 
 # The whole job
-# ---------------------------------------------------------------------------
 def run_training(spark, valid_from, test_from, run_id=None):
     # Train on train, choose the threshold on validation, measure once on test.
     # Returns (fitted model, metrics, test predictions, feature weights).

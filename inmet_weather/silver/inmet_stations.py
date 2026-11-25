@@ -1,20 +1,14 @@
 """
-Silver 7: the station tables.
+Station tables, built from the 8 header lines of each INMET file (bronze.inmet_files).
 
-Every INMET file starts with 8 lines about the station (name, state, latitude ...).
-Bronze keeps them in bronze.inmet_files (one row per file = one station, one year).
-From that table we make two Silver tables:
+  silver.station_history   one row per station-year, with name/location change flags
+  silver.station           one row per station: latest info, first/last year, change counts
 
-  silver.station_history   one row per station per year, with
-                           name_changed / location_changed compared to the year before
-  silver.station           one row per station: the newest information,
-                           plus first year, last year and how many changes it had
-
-These tables are small, so we always use ALL years.
+Small tables, so they are always built from all years.
 
 Run on its own:
-  python -m silver.stations              # dev
-  python -m silver.stations --env prod
+  python -m silver.inmet_stations              # dev
+  python -m silver.inmet_stations --env prod
 """
 
 import argparse
@@ -29,22 +23,18 @@ from pyspark.sql.window import Window
 from common.checks import has_columns, not_empty, one_row_per, run_checks
 from bronze.bronze_ingest import check_tables_match
 from common.spark import move_all_from_staging, save_to_staging, start_spark
-from silver import contract
+from silver import inmet_contract as contract
 
 
-# ---------------------------------------------------------------------------
-# Small helpers
-# ---------------------------------------------------------------------------
+# helpers
 def to_number(column):
-    # Turn INMET text into a number: "-15,789" -> -15.789.
-    # The "no value" codes ("" and "-9999") become empty (null).
+    # "-15,789" -> -15.789; missing codes -> null
     text = F.regexp_replace(F.trim(F.col(column)), ",", ".")
     return F.when(text.isin(contract.MISSING_CODES), None).otherwise(text.cast("double"))
 
 
 def to_date(column):
-    # Turn the foundation date into a real date.
-    # INMET writes it in 3 ways: 2000-05-07, 07/05/2000 or 07/05/00.
+    # foundation date comes as 2000-05-07, 07/05/2000 or 07/05/00
     text = F.trim(F.col(column))
     return (F.when(text.rlike(r"^\d{4}-\d{2}-\d{2}$"), F.to_date(text, "yyyy-MM-dd"))
              .when(text.rlike(r"^\d{2}/\d{2}/\d{4}$"), F.to_date(text, "dd/MM/yyyy"))
@@ -52,9 +42,7 @@ def to_date(column):
 
 
 def station_timezones(files):
-    # Find the time zone of every station. Brazil has 4 time zones.
-    # First look in the station list (STATION_TIMEZONE_OVERRIDE),
-    # if the station is not there, use the time zone of its state.
+    # station override first, otherwise the state's time zone
     spark = files.sparkSession
     by_state = spark.createDataFrame(list(contract.STATE_TIMEZONE.items()),
                                      "state string, state_tz string")
@@ -67,12 +55,10 @@ def station_timezones(files):
                            F.coalesce("station_tz", "state_tz").alias("timezone"))
 
 
-# ---------------------------------------------------------------------------
-# Step 1: one row per station per year
-# ---------------------------------------------------------------------------
+# station history
 def keep_one_file_per_year(files):
-    # Skip files without a station code (bad file name).
-    # If one station has two files in one year (rare), keep the file that ends last.
+    # skip files without a station code; if a station has two files in a year,
+    # keep the one that ends last
     files = files.where(F.col("station_code").isNotNull() & (F.col("station_code") != ""))
     newest_file = (Window.partitionBy("station_code", "source_year")
                    .orderBy(F.col("end_date").desc(), F.col("source_file").desc()))
@@ -81,8 +67,6 @@ def keep_one_file_per_year(files):
 
 
 def station_history(files):
-    # Clean the station info of every file: trim the text, make numbers and dates,
-    # and add the time zone. Then add the checks (see add_checks).
     files = keep_one_file_per_year(files)
     history = files.select(
         "station_code",
@@ -102,15 +86,9 @@ def station_history(files):
     return add_checks(history)
 
 
-# ---------------------------------------------------------------------------
-# Step 2: checks
-# ---------------------------------------------------------------------------
 def add_checks(history):
-    # Add 3 yes/no columns:
-    #   in_brazil:        the coordinates are inside a box around Brazil
-    #   name_changed:     the name is different from the year before
-    #   location_changed: the station moved more than a little since the year before
-    # The first year (nothing to compare with) or an empty value gives "no".
+    # in_brazil, name_changed and location_changed (vs. the previous year).
+    # First year or missing values give False.
     lat_min, lat_max = contract.BRAZIL_BOX["lat"]
     lon_min, lon_max = contract.BRAZIL_BOX["lon"]
     inside = (F.col("latitude").between(lat_min, lat_max)
@@ -119,7 +97,6 @@ def add_checks(history):
     year_before = Window.partitionBy("station_code").orderBy("source_year")
 
     def moved(column, tolerance):
-        # True when the value changed more than the tolerance since the year before
         return F.abs(F.col(column) - F.lag(column).over(year_before)) > tolerance
 
     new_name = F.upper(F.col("station_name")) != F.upper(F.lag("station_name").over(year_before))
@@ -132,12 +109,9 @@ def add_checks(history):
     return history.withColumn("location_changed", F.coalesce(new_place, F.lit(False)))
 
 
-# ---------------------------------------------------------------------------
-# Step 3: one row per station
-# ---------------------------------------------------------------------------
+# latest station
 def latest_station(history):
-    # Keep the newest year of every station, and add a short summary:
-    # first year, number of years, and how many name and location changes.
+    # newest year per station, plus first year, number of years and change counts
     station = Window.partitionBy("station_code")
     newest_first = station.orderBy(F.col("source_year").desc())
 
@@ -151,16 +125,13 @@ def latest_station(history):
     return df.drop("rank", "name_changed", "location_changed")
 
 
-# ---------------------------------------------------------------------------
-# The whole station step
-# ---------------------------------------------------------------------------
+# build and save
 STATION_TABLES = ["silver.station_history", "silver.station"]
 
 
 def stage_stations(spark, run_id):
-    # Read Bronze, make the two station tables, check them and write them
-    # to "<name>_new" (step A). The real tables are not touched yet.
-    files = spark.table("bronze.inmet_files")      # all years, on purpose
+    # build, check and write both tables to "<name>_new"; live tables are untouched
+    files = spark.table("bronze.inmet_files")      # all years on purpose
     history = station_history(files).withColumn("_silver_run_id", F.lit(run_id)).cache()
     latest = latest_station(history)
 
@@ -178,14 +149,12 @@ def stage_stations(spark, run_id):
 
 
 def build_stations(spark, run_id):
-    # Make the two station tables and replace BOTH together (step B),
-    # the whole tables are replaced.
+    # stage both tables, then replace them together
     stage_stations(spark, run_id)
     move_all_from_staging(spark, STATION_TABLES)
 
 
 def print_station_summary(history, latest):
-    # Print a short report in the log: how many stations, and which ones look strange.
     print("STATIONS:", latest.count(), "| station-years:", history.count())
     print("Stations outside Brazil (or no coordinates):", latest.where(~F.col("in_brazil")).count())
     print("Stations without time zone:", latest.where(F.col("timezone").isNull()).count())
@@ -197,12 +166,11 @@ def print_station_summary(history, latest):
 
 
 def main():
-    # Run only the station step: start Spark, build the tables, stop Spark.
     parser = argparse.ArgumentParser(description="Build the Silver station tables from Bronze.")
     parser.add_argument("--env", default="dev", choices=["dev", "prod"])
     args = parser.parse_args()
 
-    project = Path(__file__).resolve().parents[1]          # the inmet_weather folder
+    project = Path(__file__).resolve().parents[1]
     lake = os.environ.get("DAT535_OUTPUT_DIR") or str(project / "data" / "lake" / args.env)
 
     spark = start_spark("inmet-silver-stations", lake, memory="2g")

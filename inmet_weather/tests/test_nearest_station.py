@@ -1,12 +1,12 @@
 """
-Tests for the nearest station of every fire (silver/nearest_station.py).
+Tests for the nearest station of every fire (silver/fire_station_matching.py).
 Tiny fake tables, no Bronze needed.
 Run:  python -m pytest -q tests/test_nearest_station.py
 """
 import pytest
 from pyspark.sql import SparkSession
 
-from silver.nearest_station import add_nearest_station, distance_km, mark_no_station
+from silver.fire_station_matching import add_nearest_station, distance_km, mark_no_station
 
 HISTORY = "station_code string, source_year int, latitude double, longitude double, in_brazil boolean"
 FIRES = "foco_id string, source_year int, lat double, lon double, dq_issue string"

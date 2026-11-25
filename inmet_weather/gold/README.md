@@ -55,3 +55,25 @@ python -m gold.gold_build                  # all years, dev
 python -m gold.gold_build --years 2025     # only 2025
 python -m pytest -q tests/test_gold.py     # the Gold tests
 ```
+
+## Dashboard: risk map (`state_month_risk.py`)
+
+`gold.state_month_risk` has one row per state and month: `fire_count` (clean fires from
+`silver.fires`), and `avg_humidity`, `avg_temp`, `total_rain` from `silver.inmet_hourly`.
+Weather is averaged per station first, then over the state's stations, so `total_rain`
+is the monthly rain of a typical station. The join starts from the fires: a state with
+fires but no station is kept, with empty weather.
+
+It feeds a map of Brazil: each state is coloured by `fire_count`, and the weather shows on hover.
+
+```sql
+SELECT state, fire_count, avg_humidity, avg_temp, total_rain
+FROM gold.state_month_risk
+WHERE source_year = 2025 AND month = 9
+ORDER BY fire_count DESC;
+```
+
+```bash
+python -m gold.state_month_risk --years 2025
+python -m pytest -q tests/test_state_month_risk.py
+```

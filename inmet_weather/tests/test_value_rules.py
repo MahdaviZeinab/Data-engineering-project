@@ -3,8 +3,8 @@ import pytest
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 
-from silver.contract import MEASUREMENTS
-from silver.value_rules import apply_value_rules, count_flags
+from silver.inmet_contract import MEASUREMENTS
+from silver.inmet_value_rules import apply_value_rules, count_flags
 
 
 @pytest.fixture(scope="module")
@@ -45,7 +45,7 @@ def one(spark, change):
     return apply_value_rules(hours(spark, change)).first()
 
 
-# ---------------------------------------------------------------- normal and empty values
+# normal and empty values
 def test_normal_hour_has_no_flags(spark):
     row = one(spark, {})
     assert row["dq_flags"] == []
@@ -57,7 +57,7 @@ def test_empty_value_is_not_flagged(spark):
     assert row["dq_flags"] == []
 
 
-# ---------------------------------------------------------------- invalid -> empty
+# invalid -> empty
 def test_humidity_130_becomes_empty(spark):
     row = one(spark, {"humidity_pct": 130.0})
     assert row["humidity_pct"] is None
@@ -96,7 +96,7 @@ def test_negative_radiation_becomes_0(spark):
     assert row["dq_flags"] == ["radiation_negative_set_to_0"]
 
 
-# ---------------------------------------------------------------- unusual -> keep + flag
+# unusual -> keep + flag
 def test_rain_120_is_kept_with_a_flag(spark):
     row = one(spark, {"precip_mm": 120.0})
     assert row["precip_mm"] == 120.0
@@ -123,7 +123,7 @@ def test_no_jump_when_hours_are_not_next_to_each_other(spark):
     assert all(r["dq_flags"] == [] for r in df.collect())
 
 
-# ---------------------------------------------------------------- counts
+# counts
 def test_count_flags(spark):
     df = apply_value_rules(hours(spark, {"humidity_pct": 130.0}, {"humidity_pct": 120.0},
                                         {"precip_mm": 120.0}, {}))

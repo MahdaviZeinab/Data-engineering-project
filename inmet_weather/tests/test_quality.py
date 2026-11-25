@@ -15,7 +15,7 @@ def spark():
     s.stop()
 
 
-# ---------------------------------------------------------------- reconcile
+# reconcile
 def test_reconcile_ok():
     counts = reconcile(rows_in={2021: 10}, rows_out={2021: 7},
                        rows_quarantined={2021: 2}, duplicates={2021: 1})
@@ -28,7 +28,7 @@ def test_reconcile_stops_when_a_row_is_lost():
                   rows_quarantined={2021: 2}, duplicates={2021: 1})
 
 
-# ---------------------------------------------------------------- checksum
+# checksum
 def table(spark, temp, run_id):
     return spark.createDataFrame([("A001", 2021, temp, run_id)],
                                  "station_code string, source_year int, temp_c double, "
@@ -43,7 +43,7 @@ def test_checksum_sees_a_changed_value(spark):
     assert checksum(table(spark, 25.0, "run1")) != checksum(table(spark, 26.0, "run1"))
 
 
-# ---------------------------------------------------------------- rules for good rows
+# rules for good rows
 def good_rows(spark, rows):
     return spark.createDataFrame(rows, "station_code string, observed_at_utc string, "
                                        "state string, timezone string")

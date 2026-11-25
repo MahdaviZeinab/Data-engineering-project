@@ -11,7 +11,7 @@ from pyspark.sql import SparkSession
 from bronze import injection
 from bronze.fire_ingest import EXPECTED_HEADER, run_fire_bronze
 from silver import fire_contract
-from silver.contract import STATE_TIMEZONE, check_schema
+from silver.inmet_contract import STATE_TIMEZONE, check_schema
 from silver.fire_build import run_fire_silver, save_fire_silver
 
 FOCI = "bronze.fire_foci"
@@ -19,9 +19,7 @@ FILES = "bronze.fire_files"
 QUARANTINE = "bronze.fire_quarantine"
 
 
-# ---------------------------------------------------------------------------
 # Contract (plain Python)
-# ---------------------------------------------------------------------------
 def test_every_state_maps_to_a_known_uf():
     assert len(fire_contract.STATE_TO_UF) == 27                     # 26 states + DF
     assert set(fire_contract.STATE_TO_UF.values()) == set(STATE_TIMEZONE)
@@ -34,9 +32,7 @@ def test_fire_schema_check():
                      fire_contract.BRONZE_COLUMNS)
 
 
-# ---------------------------------------------------------------------------
 # Download step: the same injection.py as INMET, with --source fire (no network)
-# ---------------------------------------------------------------------------
 @pytest.fixture()
 def raw_fire(tmp_path, monkeypatch):
     # The fake data/raw folder, with the source set to "fire".
@@ -61,9 +57,7 @@ def test_fire_files_go_next_to_the_inmet_files(raw_fire):
     assert injection.is_unzipped(2020)
 
 
-# ---------------------------------------------------------------------------
 # Bronze and Silver (Spark)
-# ---------------------------------------------------------------------------
 @pytest.fixture(scope="module")
 def spark(tmp_path_factory):
     warehouse = tmp_path_factory.mktemp("warehouse")
