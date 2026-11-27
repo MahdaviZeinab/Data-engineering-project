@@ -1,26 +1,23 @@
 """
-Silver layer: turn the raw Bronze data into clean weather data.
+Silver job for the INMET weather data: bronze.inmet_hourly -> silver.inmet_hourly.
 
 Steps:
-  1. read the Bronze tables
-  2. check that Bronze has the columns we expect
-  3. turn the text values into numbers ("25,5" -> 25.5, "-9999" -> empty)
-  4. make the time: UTC time and the station's local time
-  5. remove double rows (same station and same hour)
-  6. impossible values -> empty, rare values -> flag (see value_rules.py)
-  7. put rows we can not use aside, with a reason (see quarantine.py)
-  8. add state, region and station name to every good row
-  9. check that no row is lost, and make the quality report (see quality.py)
- 10. make the station tables (see stations.py)
- 11. save all Silver tables together (if one fails, none is changed)
- 12. write a small run summary (counts) to <lake>/_runs/silver_<run_id>.json
+  1. read Bronze and check its columns
+  2. text -> numbers ("25,5" -> 25.5, "-9999" -> null)
+  3. UTC time and local time
+  4. remove duplicate station-hours
+  5. value rules (inmet_value_rules.py)
+  6. quarantine unusable rows (inmet_quarantine.py)
+  7. add station details
+  8. reconcile row counts and build the quality report (quality.py)
+  9. build the station tables (inmet_stations.py)
+ 10. save all tables together
+ 11. write a run summary to <lake>/_runs/silver_<run_id>.json
 
-All rules (names, missing codes, time zones ...) are in silver/contract.py.
-
-Run (from the inmet_weather folder):
-  python -m silver.silver_build                   # all years, dev
-  python -m silver.silver_build --years 2025      # only 2025
-  python -m silver.silver_build --env prod        # production lake
+Run from the inmet_weather folder:
+  python -m silver.inmet_build                   # all years, dev
+  python -m silver.inmet_build --years 2025
+  python -m silver.inmet_build --env prod
 """
 
 import argparse
@@ -38,19 +35,16 @@ from bronze.bronze_ingest import check_tables_match
 from common.report import (add_to_summary, check_invalid_share, markdown_table, percent,
                            report_failure, show_tables)
 from common.spark import move_all_from_staging, save_to_staging, start_spark
-from silver import contract
+from silver import inmet_contract as contract
 from silver.quality import check_silver, checksum, quality_report, reconcile, rows_per_year
-from silver.quarantine import count_reasons, quarantine_rows
-from silver.stations import (STATION_TABLES, keep_one_file_per_year, stage_stations,
+from silver.inmet_quarantine import count_reasons, quarantine_rows
+from silver.inmet_stations import (STATION_TABLES, keep_one_file_per_year, stage_stations,
                              station_timezones)
-from silver.value_rules import apply_value_rules, count_flags
+from silver.inmet_value_rules import apply_value_rules, count_flags
 
 
-# ---------------------------------------------------------------------------
-# Step 1 and 2: read Bronze and check it
-# ---------------------------------------------------------------------------
+# read Bronze
 def read_bronze(spark, years=None):
-    # Read the two Bronze tables we need. If years are given, keep only those years.
     hourly = spark.table("bronze.inmet_hourly")
     files = spark.table("bronze.inmet_files")
     if years:
@@ -60,25 +54,19 @@ def read_bronze(spark, years=None):
 
 
 def check_schema(df):
-    # Stop the job if Bronze has a missing or a new column,
-    # so we never clean data we do not understand.
+    # fail fast if Bronze gained or lost a column
     contract.check_schema(df.columns)
     return df
 
 
-# ---------------------------------------------------------------------------
-# Step 3: text -> numbers
-# ---------------------------------------------------------------------------
+# text -> numbers
 def clean_text(column):
-    # Take a Bronze value and make it ready to become a number:
-    # remove spaces and use "." instead of "," ("25,5" -> "25.5", ",8" -> ".8").
+    # trim and use "." as decimal sign: "25,5" -> "25.5"
     return F.regexp_replace(F.trim(F.col(column)), ",", ".")
 
 
 def cast_values(df):
-    # Turn every measurement into a number with an English name,
-    # for example temperatura_ar_c "25,5" -> temp_c 25.5.
-    # INMET's "no value" codes ("" and "-9999") become empty (null).
+    # cast each measurement to double under its English name; missing codes -> null
     for bronze_name, silver_name in contract.RENAME.items():
         text = clean_text(bronze_name)
         is_missing = text.isin(contract.MISSING_CODES)
@@ -88,8 +76,7 @@ def cast_values(df):
 
 
 def count_not_numeric(df):
-    # Count, per measurement, the values that are not a number and not a
-    # "no value" code (for example "abc"). They become empty, so we report them.
+    # values that are neither a number nor a missing code (they end up as null)
     counts = []
     for bronze_name, silver_name in contract.RENAME.items():
         text = clean_text(bronze_name)
@@ -99,23 +86,17 @@ def count_not_numeric(df):
     return df.agg(*counts).first().asDict()
 
 
-# ---------------------------------------------------------------------------
-# Step 4: time
-# ---------------------------------------------------------------------------
+# time
 def utc_time():
-    # Make one UTC time from the date and the hour text,
-    # for example "2025/01/01" + "0300 UTC" -> 2025-01-01 03:00.
-    # A wrong hour like "2500 UTC" gives an empty time.
-    day = F.regexp_replace("data", "-", "/")             # 2025-01-01 -> 2025/01/01
-    hhmm = F.regexp_replace("hora_utc", "[^0-9]", "")    # "0300 UTC" -> "0300"
+    # "2025/01/01" + "0300 UTC" -> 2025-01-01 03:00; an invalid hour gives null
+    day = F.regexp_replace("data", "-", "/")
+    hhmm = F.regexp_replace("hora_utc", "[^0-9]", "")
     good_hour = hhmm.rlike("^([01][0-9]|2[0-3])[0-5][0-9]$")
     return F.when(good_hour, F.to_timestamp(F.concat_ws(" ", day, hhmm), "yyyy/MM/dd HHmm"))
 
 
 def make_time(df, files):
-    # Add the UTC time and the local time of the station.
-    # We need local time, so rain in the evening is on the right local day.
-    # Rows with a bad time or an unknown time zone are kept, but marked in dq_issue.
+    # local time is needed so daily totals use the station's own day
     df = df.withColumn("observed_at_utc", utc_time())
     df = df.join(F.broadcast(station_timezones(files)), "station_code", "left")
     df = df.withColumn("local_time", F.from_utc_timestamp("observed_at_utc", F.col("timezone")))
@@ -126,28 +107,22 @@ def make_time(df, files):
     return df.withColumn("dq_issue", problem)
 
 
-# ---------------------------------------------------------------------------
-# Step 5: double rows
-# ---------------------------------------------------------------------------
+# duplicates
 def count_conflicts(df):
-    # Count the station-hours that are in Bronze more than once WITH DIFFERENT values
-    # (a real conflict: two files say different things about the same hour).
-    # 0 is a good result. If it is not 0, we look at a few examples in the report.
+    # station-hours that appear more than once with different values
     rows = df.where(F.col("observed_at_utc").isNotNull())
-    values = F.to_json(F.struct(*contract.MEASUREMENTS))      # all 17 values as one text
+    values = F.to_json(F.struct(*contract.MEASUREMENTS))
     per_key = rows.groupBy(*contract.KEY).agg(F.countDistinct(values).alias("versions"))
     return per_key.where(F.col("versions") > 1).count()
 
 
 def remove_duplicates(df):
-    # Keep only one row per station and hour. We keep the best row:
-    #   1. the hour is inside the file's own dates. Every INMET file covers one year,
-    #      so "same year as the file" is our simple test for this. The "extra hours"
-    #      (for example 1 January of the next year) lose against the next year's file.
-    #   2. it has fewer empty values
-    #   3. it was loaded last
-    #   4. file name and line number, so two runs always keep the same row
-    # Rows without a time are all kept (we can not compare them).
+    # One row per station-hour. Preference order:
+    #   1. hour falls in the file's own year (drops the overlap hours at year ends)
+    #   2. fewer null values
+    #   3. loaded most recently
+    #   4. file name and line number, so reruns pick the same row
+    # Rows without a timestamp are all kept.
     right_year = (F.year("observed_at_utc") == F.col("source_year")).cast("int")
     empty_values = sum(F.col(c).isNull().cast("int") for c in contract.MEASUREMENTS)
     best_first = (Window.partitionBy(*contract.KEY)
@@ -160,18 +135,9 @@ def remove_duplicates(df):
     return df.where(keep).drop("rank")
 
 
-# ---------------------------------------------------------------------------
-# Step 6: bad and rare values -> see silver/value_rules.py (apply_value_rules)
-# Step 7: rows we can not use -> see silver/quarantine.py (quarantine_rows)
-# ---------------------------------------------------------------------------
-
-
-# ---------------------------------------------------------------------------
-# Step 8: station details
-# ---------------------------------------------------------------------------
+# station details
 def add_station(df, files):
-    # Add state, region and station name. An hour from 2021 gets the details
-    # from the 2021 file (as the station was then), so we join on station + year.
+    # join on station + year so each hour gets the station info from that year's file
     stations = keep_one_file_per_year(files).select(
         "station_code", "source_year",
         F.upper(F.trim("state")).alias("state"),
@@ -180,20 +146,14 @@ def add_station(df, files):
     return df.join(F.broadcast(stations), ["station_code", "source_year"], "left")
 
 
-# ---------------------------------------------------------------------------
-# The whole Silver job
-# ---------------------------------------------------------------------------
+# job
 def run_silver(spark, years=None, run_id=None, summary=None):
-    # Do all the cleaning steps, one after the other.
-    # Returns three tables: (good rows, quarantined rows, quality report).
-    # If you give a dict as "summary", the counts of this run are put in it.
+    # Returns (good rows, quarantined rows, quality report). Counts go into `summary`.
     run_id = run_id or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     summary = {} if summary is None else summary
     hourly, files = read_bronze(spark, years)
-    # cache(): Spark is lazy and redoes every step for each count, check or save.
-    # We keep the tables we use many times, so each step runs only once.
-    # (cache() spills to disk when memory is full; spark.stop() frees it all.)
-    hourly = hourly.cache()                    # used for counts and the quality report
+    # cached because it is read again for the counts and the quality report
+    hourly = hourly.cache()
 
     df = check_schema(hourly)
     rows_in = rows_per_year(df)
@@ -203,7 +163,7 @@ def run_silver(spark, years=None, run_id=None, summary=None):
     df = cast_values(df)
     df = make_time(df, files)
     summary["duplicate_conflicts"] = count_conflicts(df)
-    df = remove_duplicates(df).cache()         # the Window is the slowest step: run it once
+    df = remove_duplicates(df).cache()         # window is the slowest step
     rows_left = rows_per_year(df)
     duplicates = {year: rows - rows_left.get(year, 0) for year, rows in rows_in.items()}
     summary["duplicates_removed"] = sum(duplicates.values())
@@ -218,38 +178,34 @@ def run_silver(spark, years=None, run_id=None, summary=None):
     good = add_station(good, files)
 
     run = F.lit(run_id)
-    good = good.withColumn("_silver_run_id", run).cache()                # checked, counted, saved
-    quarantined = quarantined.withColumn("_silver_run_id", run).cache()  # counted, saved
+    good = good.withColumn("_silver_run_id", run).cache()
+    quarantined = quarantined.withColumn("_silver_run_id", run).cache()
 
-    # Silver 10: no row is lost, the rules hold, and a checksum to compare reruns.
-    # If a check fails, the job stops here, so nothing is saved.
+    # stops here (before saving) if rows are lost or a rule is broken
     counts = reconcile(rows_in, rows_per_year(good), rows_per_year(quarantined), duplicates)
-    df.unpersist()                             # good and quarantined are kept now
+    df.unpersist()
     check_silver(good)
     summary["reconcile"] = counts
     summary["checksum"] = checksum(good)
     print("SILVER: reconcile ok:", counts, "| checksum:", summary["checksum"])
 
-    # Silver 11: the "before -> after" numbers per year
     report = quality_report(hourly, good, counts).withColumn("_silver_run_id", run)
     return good, quarantined, report
 
 
 def save_silver(spark, silver, years, run_id, quarantined=None, report=None):
-    # Save all Silver tables TOGETHER, like Bronze does:
-    #   step A: check the hourly table and write all tables to "<name>_new"
-    #   step B: replace them all at once; if one fails, all get their old rows back.
-    # The hourly table replaces only the years we ran,
-    # the station tables are small and always made from all years.
+    # Write everything to "<name>_new" first, then swap all tables in one go
+    # (rolled back if any swap fails). Hourly data replaces only the given years;
+    # the station tables are rebuilt from all years.
     run_checks(silver, [not_empty, has_columns(*contract.KEY, *contract.MEASUREMENTS)])
     save_to_staging(spark, silver, "silver.inmet_hourly")
     stage_stations(spark, run_id)
 
     tables = {"silver.inmet_hourly": years}
-    if quarantined is not None:                 # Silver 9: the rows we put aside
+    if quarantined is not None:
         save_to_staging(spark, quarantined, "silver.inmet_quarantine")
         tables["silver.inmet_quarantine"] = years
-    if report is not None:                      # Silver 11: the quality report
+    if report is not None:
         save_to_staging(spark, report, "silver.quality_report")
         tables["silver.quality_report"] = years
     for name in STATION_TABLES:
@@ -258,7 +214,6 @@ def save_silver(spark, silver, years, run_id, quarantined=None, report=None):
 
 
 def quarantined_per_reason(spark):
-    # {reason: number of rows} from silver.inmet_quarantine (empty if there is no table yet)
     if not spark.catalog.tableExists("silver.inmet_quarantine"):
         return {}
     rows = spark.table("silver.inmet_quarantine").groupBy("dq_issue").count().collect()
@@ -266,9 +221,7 @@ def quarantined_per_reason(spark):
 
 
 def write_run_summary(lake, run_id, years, summary, spark):
-    # Silver 3: save the numbers of this run as a small JSON file, one file per run,
-    # so the report can show them and we can compare runs.
-    # Example: <lake>/_runs/silver_20251119T180000Z.json
+    # one JSON file per run, e.g. <lake>/_runs/silver_20251119T180000Z.json
     result = spark.table("silver.inmet_hourly")
     summary = {
         "run_id": run_id,
@@ -288,7 +241,6 @@ def write_run_summary(lake, run_id, years, summary, spark):
 
 
 def print_summary(spark):
-    # Print a short report in the log: rows per year and a few example rows.
     result = spark.table("silver.inmet_hourly")
     result.groupBy("source_year").count().orderBy("source_year").show()
     result.select("station_code", "observed_at_utc", "local_time", "timezone",
@@ -297,9 +249,8 @@ def print_summary(spark):
 
 
 def write_report(spark, counts, years=None):
-    # The Silver result per year on the GitHub run page (see common/report.py).
-    # invalid % = rows moved to quarantine / rows read from Bronze.
-    # Removed duplicates are shown on their own: they are not bad data, only repeated.
+    # Results table for the GitHub run page.
+    # invalid % = quarantined / Bronze rows; duplicates are listed separately.
     rows = []
     for year, c in sorted(counts.items()):
         invalid_pct = percent(c["bad_rows_moved_to_quarantine"], c["rows_read_from_bronze"])
@@ -323,19 +274,18 @@ def write_report(spark, counts, years=None):
 
 
 def main():
-    # Read the command line options, start Spark, clean the data and save it.
     parser = argparse.ArgumentParser(description="Build the Silver tables from Bronze.")
     parser.add_argument("--env", default="dev", choices=["dev", "prod"])
     parser.add_argument("--years", type=int, nargs="*")
     args = parser.parse_args()
 
-    # The lake folder keeps the Spark tables. CI can choose it with DAT535_OUTPUT_DIR.
-    project = Path(__file__).resolve().parents[1]          # the inmet_weather folder
+    # CI can override the lake folder with DAT535_OUTPUT_DIR
+    project = Path(__file__).resolve().parents[1]
     lake = os.environ.get("DAT535_OUTPUT_DIR") or str(project / "data" / "lake" / args.env)
 
-    spark = start_spark("inmet-silver", lake, memory="2g")   # the VM has only 8 GB
+    spark = start_spark("inmet-silver", lake, memory="2g")   # VM has 8 GB
     try:
-        # stop if Bronze was only half replaced (a killed Bronze run)
+        # stop if a Bronze run was killed halfway
         check_tables_match(spark)
 
         run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -347,7 +297,7 @@ def main():
         spark.table("silver.quality_report").show(truncate=False)
         write_run_summary(lake, run_id, args.years, summary, spark)
         print_summary(spark)
-        write_report(spark, summary["reconcile"], args.years)   # the result on the GitHub run page
+        write_report(spark, summary["reconcile"], args.years)
         add_to_summary("**Silver INMET tables** (click a table to see its first rows)")
         show_tables(spark, ["silver.inmet_hourly", "silver.inmet_quarantine",
                             "silver.quality_report", *STATION_TABLES], args.years)

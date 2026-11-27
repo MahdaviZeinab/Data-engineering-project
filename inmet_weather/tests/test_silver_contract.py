@@ -1,7 +1,7 @@
 """Tests for the Silver contract (S2). Plain Python, no Spark needed."""
 import pytest
 
-from silver.contract import (BRONZE_COLUMNS, INVALID, MEASUREMENTS, STATE_TIMEZONE,
+from silver.inmet_contract import (BRONZE_COLUMNS, INVALID, MEASUREMENTS, STATE_TIMEZONE,
                              UNUSUAL, check_schema)
 
 

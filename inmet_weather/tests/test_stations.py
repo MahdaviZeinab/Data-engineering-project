@@ -5,9 +5,9 @@ import pytest
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 
-from silver import contract
-from silver.silver_build import save_silver
-from silver.stations import build_stations, latest_station, station_history
+from silver import inmet_contract as contract
+from silver.inmet_build import save_silver
+from silver.inmet_stations import build_stations, latest_station, station_history
 
 SCHEMA = ("source_file string, source_year int, station_code string, end_date date, "
           "region string, state string, station_name string, wmo_code string, "
@@ -46,7 +46,7 @@ def by_year(df):
     return {r.source_year: r for r in df.collect()}
 
 
-# ---------------------------------------------------------------- types
+# types
 def test_numbers_and_date_are_clean(spark):
     r = station_history(files(spark, [("A001", 2021, {})])).first()
     assert (r.latitude, r.longitude, r.altitude) == (-15.78944444, -47.92583332, 1159.54)
@@ -61,7 +61,7 @@ def test_old_date_formats(spark):
     assert got == {2019: dt.date(2000, 5, 7), 2020: dt.date(2000, 5, 7), 2021: None}
 
 
-# ---------------------------------------------------------------- history
+# history
 def test_one_row_per_station_and_year(spark):
     df = station_history(files(spark, [("A001", 2020, {}), ("A001", 2021, {}),
                                        ("A002", 2021, {}), ("", 2021, {})]))   # bad file name
@@ -77,7 +77,7 @@ def test_two_files_same_year_keeps_the_last_one(spark):
     assert df.first().source_file == "INMET_A001_b.CSV"
 
 
-# ---------------------------------------------------------------- changes
+# changes
 def test_name_change(spark):
     df = station_history(files(spark, [("A001", 2020, {}),
                                        ("A001", 2021, {"name": "BRASILIA NOVA"}),
@@ -100,7 +100,7 @@ def test_missing_coordinates_are_not_a_change(spark):
     assert by_year(df)[2021].location_changed is False
 
 
-# ---------------------------------------------------------------- time zone
+# time zone
 def test_timezone_from_state_and_override(spark, monkeypatch):
     monkeypatch.setattr(contract, "STATION_TIMEZONE_OVERRIDE", {"A003": "America/Noronha"})
     df = station_history(files(spark, [("A001", 2021, {}),
@@ -112,7 +112,7 @@ def test_timezone_from_state_and_override(spark, monkeypatch):
                    "A003": "America/Noronha", "A004": None}
 
 
-# ---------------------------------------------------------------- inside Brazil
+# inside Brazil
 def test_inside_brazil(spark):
     df = station_history(files(spark, [
         ("A001", 2021, {}),                                         # Brasilia
@@ -125,7 +125,7 @@ def test_inside_brazil(spark):
     assert got == {"A001": True, "A002": True, "A003": False, "A004": False, "A005": False}
 
 
-# ---------------------------------------------------------------- latest
+# latest
 def test_latest_station(spark):
     history = station_history(files(spark, [("A001", 2020, {}),
                                             ("A001", 2021, {"name": "BRASILIA NOVA"}),
@@ -140,7 +140,7 @@ def test_latest_station(spark):
     assert (latest["A002"].name_changes, latest["A002"].location_changes) == (0, 0)
 
 
-# ---------------------------------------------------------------- whole step
+# whole step
 def test_build_stations_saves_both_tables(spark):
     spark.sql("CREATE DATABASE IF NOT EXISTS bronze")
     files(spark, [("A001", 2020, {}), ("A001", 2021, {}), ("A002", 2021, {})]) \
@@ -153,7 +153,7 @@ def test_build_stations_saves_both_tables(spark):
     assert station.first()["_silver_run_id"] == "test"
 
 
-# ---------------------------------------------------------------- saving all Silver tables together
+# saving all Silver tables together
 def silver_hourly(spark, run_id, years):
     """A tiny clean Silver hourly table: 1 row per year."""
     rows = [("A001", f"{year}-01-01 00:00:00", year, run_id) for year in years]

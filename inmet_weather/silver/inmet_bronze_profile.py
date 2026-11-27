@@ -1,15 +1,10 @@
 """
-Silver 1: look at the Bronze data before we clean it.
+Profile the INMET Bronze data before cleaning. Read only.
 
-This job only READS Bronze; it never changes a Bronze table.
-Every result is a small Spark table in the database "profile",
-for example profile.measurements. Look at one with:
-    spark.table("profile.measurements").show()
-
-Run (from the inmet_weather folder):
-  python -m silver.profile_bronze                  # all years, dev
-  python -m silver.profile_bronze --years 2025     # only 2025
-  python -m silver.profile_bronze --env prod       # production lake
+Run from the inmet_weather folder:
+  python -m silver.inmet_bronze_profile                  # all years, dev
+  python -m silver.inmet_bronze_profile --years 2025
+  python -m silver.inmet_bronze_profile --env prod
 """
 
 import argparse
@@ -23,18 +18,15 @@ from pyspark.sql import functions as F
 from bronze.bronze_ingest import COLUMNS
 from common.spark import save_table, start_spark
 
-MEASUREMENTS = COLUMNS[2:]   # the 17 measurements = every column except data and hora_utc
-MISSING_CODE = -9999         # INMET writes -9999 for "no value"
+MEASUREMENTS = COLUMNS[2:]   # all columns except data and hora_utc
+MISSING_CODE = -9999
 
 DATE_PATTERN = r"^\d{4}[/-]\d{2}[/-]\d{2}$"         # 2020/01/31 or 2020-01-31
 HOUR_PATTERN = r"^([01]\d|2[0-3])(00 UTC|:00)$"    # 0000 UTC ... 2300 UTC, or 00:00
 
 
-# ---------------------------------------------------------------------------
-# Read Bronze
-# ---------------------------------------------------------------------------
+# read Bronze
 def read_bronze(spark, years=None):
-    # Read the two Bronze tables. If years are given, keep only those years.
     hourly = spark.table("bronze.inmet_hourly")
     files = spark.table("bronze.inmet_files")
     if years:
@@ -44,17 +36,13 @@ def read_bronze(spark, years=None):
 
 
 def to_number(column):
-    # Make a number from Bronze text, only to look at it: "884,1" -> 884.1.
-    # Text that is not a number gives empty (null). Bronze itself is not changed.
+    # "884,1" -> 884.1, non-numeric -> null (for profiling only)
     return F.expr(f"try_cast(regexp_replace(trim(`{column}`), ',', '.') AS DOUBLE)")
 
 
-# ---------------------------------------------------------------------------
-# The 17 measurements
-# ---------------------------------------------------------------------------
+# measurements
 def profile_one_measurement(hourly, name):
-    # For one measurement and every year: how many values are empty, -9999,
-    # not a number, or valid, and the min / median / max of the valid ones.
+    # per year: empty / -9999 / non-numeric / valid counts, and min, p01, median, p99, max
     raw = F.trim(F.col(name))
     number = to_number(name)
     is_empty = raw.isNull() | (raw == "")
@@ -78,17 +66,13 @@ def profile_one_measurement(hourly, name):
 
 
 def profile_measurements(hourly):
-    # Profile all 17 measurements and put the results under each other in one table.
     tables = [profile_one_measurement(hourly, name) for name in MEASUREMENTS]
     return reduce(lambda a, b: a.unionByName(b), tables)
 
 
-# ---------------------------------------------------------------------------
-# Dates, hours and missing hours (UTC)
-# ---------------------------------------------------------------------------
+# dates and hours (UTC)
 def add_utc_time(hourly):
-    # Add utc_date and utc_hour, only to look at them.
-    # They are empty when the text is not a good date or hour.
+    # utc_date and utc_hour, null when the text doesn't parse
     date_text = F.regexp_replace("data", "-", "/")
     utc_date = F.when(F.col("data").rlike(DATE_PATTERN), F.to_date(date_text, "yyyy/MM/dd"))
     utc_hour = F.when(F.col("hora_utc").rlike(HOUR_PATTERN),
@@ -97,8 +81,7 @@ def add_utc_time(hourly):
 
 
 def timestamp_formats(hourly):
-    # Which ways of writing the date and the hour are used? Every digit becomes 9,
-    # so "2020/01/31" -> "9999/99/99" and "0100 UTC" -> "9999 UTC".
+    # date/hour formats in use: every digit -> 9 ("2020/01/31" -> "9999/99/99")
     dates = hourly.select("source_year", F.lit("data").alias("column"),
                           F.regexp_replace("data", r"\d", "9").alias("format"))
     hours = hourly.select("source_year", F.lit("hora_utc").alias("column"),
@@ -107,7 +90,6 @@ def timestamp_formats(hourly):
 
 
 def timestamp_problems(hourly):
-    # Per year: how many rows have a date or an hour we can not read.
     timed = add_utc_time(hourly)
     return timed.groupBy("source_year").agg(
         F.count("*").alias("rows"),
@@ -116,9 +98,8 @@ def timestamp_problems(hourly):
 
 
 def hours_per_station_day(hourly, files):
-    # For every station and day: how many different hours we have (0 to 24).
-    # Days with no rows at all come from the file dates (start_date to end_date),
-    # because a missing day is not in the hourly table.
+    # hours per station-day (0-24). Fully missing days come from the
+    # file's start_date..end_date, since they have no rows in hourly.
     observed = (add_utc_time(hourly)
                 .where(F.col("utc_date").isNotNull() & F.col("utc_hour").isNotNull())
                 .groupBy("station_code", "utc_date")
@@ -132,27 +113,21 @@ def hours_per_station_day(hourly, files):
 
 
 def hours_histogram(station_days):
-    # Per year: how many station-days have 24 hours, 23 hours, ... 0 hours.
     return (station_days.groupBy("year", "hours").count()
             .withColumnRenamed("count", "station_days"))
 
 
-# ---------------------------------------------------------------------------
-# Stations
-# ---------------------------------------------------------------------------
+# stations
 def stations_per_state(files):
-    # How many different stations each state has.
     return files.groupBy("state").agg(F.countDistinct("station_code").alias("stations"))
 
 
 def stations_per_year(files):
-    # How many different stations have a file in each year.
     return files.groupBy("source_year").agg(F.countDistinct("station_code").alias("stations"))
 
 
 def station_changes(files):
-    # Stations whose name, state or position is not the same in every year.
-    # We only look here, nothing is corrected.
+    # stations whose name, state or position differs between years (report only)
     per_station = files.groupBy("station_code").agg(
         F.concat_ws(",", F.sort_array(F.collect_set("source_year"))).alias("years"),
         F.concat_ws(" | ", F.collect_set(F.trim("station_name"))).alias("names"),
@@ -165,11 +140,8 @@ def station_changes(files):
     return per_station.where(changed)
 
 
-# ---------------------------------------------------------------------------
-# The whole profile job
-# ---------------------------------------------------------------------------
+# job
 def run_profile(spark, hourly, files):
-    # Make every profile table, save it as a Spark table and print it.
     rows_per_year = (hourly.groupBy("source_year").agg(F.count("*").alias("hourly_rows"))
                      .join(files.groupBy("source_year").agg(F.count("*").alias("files")),
                            "source_year", "full"))
@@ -193,13 +165,12 @@ def run_profile(spark, hourly, files):
 
 
 def main():
-    # Read the command line options, start Spark and make the profile.
     parser = argparse.ArgumentParser(description="Profile the Bronze tables (read only).")
     parser.add_argument("--env", default="dev", choices=["dev", "prod"])
     parser.add_argument("--years", type=int, nargs="*")
     args = parser.parse_args()
 
-    project = Path(__file__).resolve().parents[1]          # the inmet_weather folder
+    project = Path(__file__).resolve().parents[1]
     lake = os.environ.get("DAT535_OUTPUT_DIR") or str(project / "data" / "lake" / args.env)
 
     spark = start_spark("inmet-profile-bronze", lake)

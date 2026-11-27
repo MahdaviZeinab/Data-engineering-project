@@ -3,6 +3,7 @@
 # When does it run?
 #   - automatically after every push to main (= after a Pull Request is merged)
 #   - by hand: Actions tab -> "Production Pipeline" -> Run workflow
+#   - every year on 10 January (schedule): only the year before, e.g. 2026 in January 2027
 #
 # Every run WAITS for approval: GitHub Environment "main" has "Required reviewers".
 # A reviewer opens the run and clicks "Review deployments" -> Approve.
@@ -16,6 +17,8 @@ name: Production Pipeline
 on:
   push:
     branches: [main]
+  schedule:
+    - cron: "0 2 10 1 *"     # 10 January, 02:00 UTC (03:00 in Norway)
   workflow_dispatch:
     inputs:
       years:
@@ -33,10 +36,27 @@ env:
   YEARS: ${{ inputs.years || '2020 2021 2022 2023 2024 2025' }}   # after a push: all years
 
 jobs:
+  # Decide which years to run. Schedule: only last year. Otherwise: $YEARS from above.
+  plan:
+    runs-on: [self-hosted, linux, openstack]
+    outputs:
+      years: ${{ steps.pick.outputs.years }}
+    steps:
+      - id: pick
+        run: |
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            echo "years=$(( $(date -u +%Y) - 1 ))" >> "$GITHUB_OUTPUT"
+          else
+            echo "years=$YEARS" >> "$GITHUB_OUTPUT"
+          fi
+
   bronze:
+    needs: plan
     runs-on: [self-hosted, linux, openstack]
     environment: main               # approval gate
     timeout-minutes: 240
+    env:
+      YEARS: ${{ needs.plan.outputs.years }}
     defaults:
       run:
         working-directory: inmet_weather
@@ -106,10 +126,12 @@ jobs:
           echo "| Result | ${{ job.status }} |" >> $GITHUB_STEP_SUMMARY
 
   silver:
-    needs: bronze                   # starts only when Bronze worked, same commit
+    needs: [plan, bronze]           # starts only when Bronze worked, same commit
     runs-on: [self-hosted, linux, openstack]
     environment: main
     timeout-minutes: 240
+    env:
+      YEARS: ${{ needs.plan.outputs.years }}
     defaults:
       run:
         working-directory: inmet_weather
@@ -119,7 +141,7 @@ jobs:
       - name: Build Silver
         env:
           DAT535_OUTPUT_DIR: ${{ env.DATA_ROOT }}/lake/${{ env.LAKE_ENV }}
-        run: $DATA_ROOT/venv/bin/python -m silver.silver_build --env "$LAKE_ENV" --years $YEARS
+        run: $DATA_ROOT/venv/bin/python -m silver.inmet_build --env "$LAKE_ENV" --years $YEARS
 
       - name: Build fire Silver
         env:
@@ -141,10 +163,12 @@ jobs:
           echo "| Result | ${{ job.status }} |" >> $GITHUB_STEP_SUMMARY
 
   gold:
-    needs: silver                   # starts only when Silver worked, same commit
+    needs: [plan, silver]           # starts only when Silver worked, same commit
     runs-on: [self-hosted, linux, openstack]
     environment: main
     timeout-minutes: 240
+    env:
+      YEARS: ${{ needs.plan.outputs.years }}
     defaults:
       run:
         working-directory: inmet_weather
@@ -155,6 +179,11 @@ jobs:
         env:
           DAT535_OUTPUT_DIR: ${{ env.DATA_ROOT }}/lake/${{ env.LAKE_ENV }}
         run: $DATA_ROOT/venv/bin/python -m gold.gold_build --env "$LAKE_ENV" --years $YEARS
+
+      - name: Build Gold risk map
+        env:
+          DAT535_OUTPUT_DIR: ${{ env.DATA_ROOT }}/lake/${{ env.LAKE_ENV }}
+        run: $DATA_ROOT/venv/bin/python -m gold.state_month_risk --env "$LAKE_ENV" --years $YEARS
 
       - name: Train fire model (logistic regression)
         env:

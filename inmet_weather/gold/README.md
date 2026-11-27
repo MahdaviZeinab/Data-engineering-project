@@ -55,3 +55,52 @@ python -m gold.gold_build                  # all years, dev
 python -m gold.gold_build --years 2025     # only 2025
 python -m pytest -q tests/test_gold.py     # the Gold tests
 ```
+
+## Use case 2: regions suitable for wind and solar energy
+
+**Question:** which states and stations have a climate that is good enough for wind
+or solar power? **Consumer:** an energy planner who wants a short list of regions worth
+a detailed study. Built in `gold_build.py` (same job), rules in `gold_contract.py`.
+
+| Spark table | One row per | Content |
+|---|---|---|
+| `gold.renewable_potential_by_station` | station × year | mean wind speed, wind power density, mean daily radiation (GHI), data coverage, `wind_class`, `wind_suitable`, `solar_class`, `solar_suitable`, name and position |
+| `gold.renewable_potential_by_state` | state × year | stations, stations suitable for wind / solar, best wind class, averages, state `solar_class` |
+
+**Criteria** (international thresholds, not our own):
+
+| | Suitable if | Source |
+|---|---|---|
+| Wind | wind power class ≥ 3 at 10 m (≥ 150 W/m², about ≥ 5.1 m/s) | [NREL / PNL wind power classes](https://p2infohouse.org/ref/11/10589/table30.htm) |
+| Solar | excellent: GHI ≥ 5.6, favourable: 4.4–5.6, limited: < 4.4 kWh/m² per day | [World Bank PV potential classes](https://documents1.worldbank.org/curated/en/466331592817725242/text/Global-Photovoltaic-Power-Potential-by-Country.txt) (PV output / performance ratio 0.8) |
+
+- Power density = ½ · 1.225 · mean(speed³): the energy grows with the cube of the speed.
+- A station-year gets a class only with data for ≥ 80 % of its hours (wind) and days (solar).
+- Checks before saving: not empty, one row per station and year. The station table
+  replaces only the years we ran; the state table is rebuilt from all years.
+
+**Limits:** these are *candidate* regions. Wind is measured at 10 m, not at turbine
+height; stations are not placed for wind energy; and other important factors (gusts,
+dust, heat, protected areas, land use, distance to the grid) are not in our data.
+
+## Dashboard: risk map (`state_month_risk.py`)
+
+`gold.state_month_risk` has one row per state and month: `fire_count` (clean fires from
+`silver.fires`), and `avg_humidity`, `avg_temp`, `total_rain` from `silver.inmet_hourly`.
+Weather is averaged per station first, then over the state's stations, so `total_rain`
+is the monthly rain of a typical station. The join starts from the fires: a state with
+fires but no station is kept, with empty weather.
+
+It feeds a map of Brazil: each state is coloured by `fire_count`, and the weather shows on hover.
+
+```sql
+SELECT state, fire_count, avg_humidity, avg_temp, total_rain
+FROM gold.state_month_risk
+WHERE source_year = 2025 AND month = 9
+ORDER BY fire_count DESC;
+```
+
+```bash
+python -m gold.state_month_risk --years 2025
+python -m pytest -q tests/test_state_month_risk.py
+```

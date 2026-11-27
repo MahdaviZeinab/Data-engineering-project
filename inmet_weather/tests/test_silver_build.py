@@ -3,10 +3,10 @@ import pytest
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 
-from silver.contract import BRONZE_COLUMNS, MEASUREMENTS
+from silver.inmet_contract import BRONZE_COLUMNS, MEASUREMENTS
 import json
 
-from silver.silver_build import (cast_values, count_conflicts, count_not_numeric, make_time,
+from silver.inmet_build import (cast_values, count_conflicts, count_not_numeric, make_time,
                                  remove_duplicates, run_silver, write_run_summary)
 
 TEMP = "temperatura_ar_c"   # becomes temp_c
@@ -71,7 +71,7 @@ def test_years_option(spark):
     assert good.count() + quarantined.count() == 1
 
 
-# ---------------------------------------------------------------- Silver 10 and 11: whole run
+# whole run
 def test_good_rows_get_station_details(spark):
     good_bronze(spark)
     good, quarantined, report = run_silver(spark, run_id="r1")
@@ -133,7 +133,7 @@ def test_count_not_numeric(spark):
     assert counts["precip_mm"] == 0
 
 
-# ---------------------------------------------------------------- Silver 5: time
+# time
 def hours(spark, rows):
     """Make fake hour rows: station, date, hour."""
     return spark.createDataFrame(rows, "station_code string, data string, hora_utc string")
@@ -163,7 +163,7 @@ def test_bad_time_and_unknown_zone_get_a_reason(spark):
     assert issues == ["bad_timestamp", "bad_timestamp", "ok", "unknown_timezone"]
 
 
-# ---------------------------------------------------------------- Silver 6: duplicates
+# duplicates
 def dup_rows(spark, rows):
     """Fake rows after Silver 5: (station, UTC time, source_year, temp_c, ingestion time).
     All other measurements are 1.0, so only temp_c decides 'fewer missing values'.
@@ -212,8 +212,6 @@ def test_rows_without_time_are_kept(spark):
     assert df.count() == 2              # Silver 9 deals with them
 
 
-
-
 def test_same_rows_keep_first_line_every_time(spark):
     # two rows that are equal in everything else: the lower line number wins, always
     for _ in range(3):
@@ -234,7 +232,7 @@ def test_count_conflicts(spark):
     assert count_conflicts(df) == 2
 
 
-# ---------------------------------------------------------------- Silver 3: run summary
+# run summary
 def test_run_fills_summary(spark):
     fake_bronze(spark, BRONZE_COLUMNS)
     summary = {}

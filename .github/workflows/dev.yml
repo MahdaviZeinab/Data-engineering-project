@@ -102,7 +102,7 @@ jobs:
       - name: Build Silver
         env:
           DAT535_OUTPUT_DIR: ${{ env.DATA_ROOT }}/lake/${{ env.LAKE_ENV }}
-        run: $DATA_ROOT/venv/bin/python -m silver.silver_build --env "$LAKE_ENV" --years $YEARS
+        run: $DATA_ROOT/venv/bin/python -m silver.inmet_build --env "$LAKE_ENV" --years $YEARS
 
       - name: Build fire Silver
         env:
@@ -138,6 +138,11 @@ jobs:
         env:
           DAT535_OUTPUT_DIR: ${{ env.DATA_ROOT }}/lake/${{ env.LAKE_ENV }}
         run: $DATA_ROOT/venv/bin/python -m gold.gold_build --env "$LAKE_ENV" --years $YEARS
+
+      - name: Build Gold risk map
+        env:
+          DAT535_OUTPUT_DIR: ${{ env.DATA_ROOT }}/lake/${{ env.LAKE_ENV }}
+        run: $DATA_ROOT/venv/bin/python -m gold.state_month_risk --env "$LAKE_ENV" --years $YEARS
 
       - name: Train fire model (logistic regression)
         env:

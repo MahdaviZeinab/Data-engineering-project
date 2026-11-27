@@ -1,13 +1,13 @@
 """
-Tests for the state check of the fires (silver/state_check.py).
+Tests for the state check of the fires (silver/fire_state_check.py).
 Run:  python -m pytest -q tests/test_state_check.py
 """
 import pytest
 from pyspark.sql import SparkSession
 
 from silver import fire_contract
-from silver.contract import STATE_TIMEZONE
-from silver.state_check import inside_state
+from silver.inmet_contract import STATE_TIMEZONE
+from silver.fire_state_check import inside_state
 
 
 @pytest.fixture(scope="module")
